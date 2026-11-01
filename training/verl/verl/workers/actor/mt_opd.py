@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 __all__ = [
+    "build_precision_weights",
     "build_domain_weights",
     "select_routed_teacher_logprobs",
     "compute_domain_share_metrics",
@@ -19,6 +20,51 @@ __all__ = [
     "compute_domain_loss_weights",
     "apply_teacher_conflict_policy",
 ]
+
+
+def select_student_precision(model, metadata):
+    """Select one precision for a microbatch, retaining it through backward."""
+    modules = [module for module in model.modules()
+               if hasattr(module, "parent_bits") and hasattr(module, "base_lut4")
+               and hasattr(module, "delta")]
+    if not modules:
+        return
+    bits = metadata.get("student_bits")
+    if bits is None or len(bits) == 0:
+        raise ValueError("AnyPrecision microbatches require student_bits")
+    values = list(bits)
+    if any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
+           for value in values):
+        raise ValueError("student_bits must contain integers")
+    if len(set(values)) != 1 or any(int(values[0]) not in module.precisions for module in modules):
+        raise ValueError("AnyPrecision microbatches must have one supported precision")
+    for module in modules:
+        module.precision = int(values[0])
+
+
+def build_precision_weights(student_bits, teacher_bits, device):
+    """Route each sample to exactly one precision-matched teacher."""
+    def validate_bits(values, name):
+        if values is None or len(values) == 0:
+            raise ValueError(f"{name} must be a non-empty sequence")
+        result = []
+        for value in values:
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"{name} must contain integer bit widths, got {value!r}")
+            if value <= 0:
+                raise ValueError(f"{name} bit widths must be positive")
+            result.append(int(value))
+        return result
+
+    teachers = validate_bits(teacher_bits, "teacher_bits")
+    students = validate_bits(student_bits, "student_bits")
+    if len(set(teachers)) != len(teachers):
+        raise ValueError("teacher_bits must be unique for precision routing")
+    unknown = set(students) - set(teachers)
+    if unknown:
+        raise ValueError(f"No teacher configured for student bit widths: {sorted(unknown)}")
+    indices = torch.tensor([teachers.index(bits) for bits in students], device=device)
+    return torch.nn.functional.one_hot(indices, num_classes=len(teachers)).float()
 
 
 def build_domain_weights(

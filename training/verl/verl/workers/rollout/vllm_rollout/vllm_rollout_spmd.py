@@ -408,6 +408,13 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        self.anyprecision = engine_kwargs.get("quantization") == "anyprecision"
+        if self.anyprecision:
+            if load_format != "anyprecision" or not config.enforce_eager or tensor_parallel_size != 1:
+                raise ValueError("AnyPrecision requires its compressed loader, eager execution and TP=1")
+            if config.enable_prefix_caching or self.lora_kwargs:
+                raise ValueError("AnyPrecision currently requires prefix caching and LoRA disabled")
+            self.sleep_level = 1
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
@@ -512,6 +519,27 @@ class vLLMRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        if self.anyprecision and not kwargs.pop("_precision_group", False):
+            from any_precision.integrations.vllm.control import set_precision
+
+            bits = prompts.non_tensor_batch.get("student_bits")
+            if bits is None or len(bits) != len(prompts):
+                raise ValueError("Compressed rollout requires student_bits for every prompt")
+            if any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
+                   or int(value) not in (4, 8) for value in bits):
+                raise ValueError("Compressed rollout requires integer W4/W8 student_bits")
+            order = []
+            results = []
+            for precision in sorted(set(int(value) for value in bits)):
+                indices = np.flatnonzero(np.asarray(bits) == precision)
+                self.inference_engine.reset_prefix_cache()
+                self.inference_engine.apply_model(lambda model: set_precision(model, precision))
+                results.append(self.generate_sequences(prompts.select_idxs(indices), _precision_group=True, **kwargs))
+                order.extend(indices.tolist())
+            output = DataProto.concat(results)
+            output.reorder(torch.tensor(np.argsort(order)))
+            return output
+
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         # left-padded attention_mask
         attention_mask = prompts.batch["attention_mask"]
@@ -695,6 +723,14 @@ class vLLMRollout(BaseRollout):
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
+        if self.anyprecision:
+            from any_precision.integrations.vllm.control import update_from_actor
+
+            state = {name: value.detach().cpu() for name, value in weights
+                     if name.endswith((".delta", ".base_lut4", ".base_lut8"))}
+            self.inference_engine.reset_prefix_cache()
+            self.inference_engine.apply_model(lambda model: update_from_actor(model, state.items()))
+            return
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)

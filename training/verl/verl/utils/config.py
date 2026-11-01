@@ -149,7 +149,13 @@ def validate_config(
 
     # Actor validation done in ActorConfig.__post_init__ and validate()
     actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
-    actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
+    anyprecision = config.actor_rollout_ref.model.get("anyprecision", None)
+    precision_count = len(anyprecision.precisions) if anyprecision else 1
+    if anyprecision:
+        paired_batch_size = config.data.train_batch_size * precision_count * config.actor_rollout_ref.rollout.n
+        if actor_config.ppo_epochs != 1 or actor_config.ppo_mini_batch_size != paired_batch_size:
+            raise ValueError("AnyPrecision requires one PPO epoch and one minibatch spanning all precision rollouts")
+    actor_config.validate(n_gpus, config.data.train_batch_size * precision_count, config.actor_rollout_ref.model)
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if use_reference_policy:

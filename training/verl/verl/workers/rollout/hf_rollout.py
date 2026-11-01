@@ -30,6 +30,7 @@ from transformers import GenerationConfig
 from verl import DataProto
 from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.torch_functional import get_response_mask
+from verl.workers.actor.mt_opd import select_student_precision
 
 from .base import BaseRollout
 
@@ -38,9 +39,17 @@ __all__ = ["HFRollout"]
 
 class HFRollout(BaseRollout):
     def __init__(self, module: nn.Module, config):
-        super().__init__()
         self.config = config
         self.module = module
+
+    async def resume(self, tags):
+        return None
+
+    async def release(self):
+        return None
+
+    async def update_weights(self, weights, **kwargs):
+        raise RuntimeError("HF rollout shares actor parameters and must not receive external weight updates")
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
@@ -52,6 +61,7 @@ class HFRollout(BaseRollout):
 
     @torch.no_grad()
     def _generate_minibatch(self, prompts: DataProto) -> DataProto:
+        select_student_precision(self.module, prompts.non_tensor_batch)
         # make sampling args can be overridden by inputs
         do_sample = prompts.meta_info.get("do_sample", self.config.do_sample)
         is_validate = prompts.meta_info.get("validate", False)
@@ -112,7 +122,7 @@ class HFRollout(BaseRollout):
             output = self.module.generate(
                 input_ids=idx,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=position_ids.transpose(0, 1) if position_ids.ndim == 3 else position_ids,
                 do_sample=do_sample,
                 max_new_tokens=response_length,
                 eos_token_id=eos_token_id,
@@ -151,7 +161,9 @@ class HFRollout(BaseRollout):
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
         delta_position_id = delta_position_id.unsqueeze(0).repeat(generated_batch_size, 1)
 
-        response_position_ids = position_ids[:, -1:] + delta_position_id
+        if position_ids.ndim == 3:
+            delta_position_id = delta_position_id.unsqueeze(1)
+        response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
 
         response_attention_mask = get_response_mask(

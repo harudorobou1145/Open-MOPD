@@ -43,7 +43,7 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.actor import BasePPOActor
-from verl.workers.actor.mt_opd import refresh_opd_advantage
+from verl.workers.actor.mt_opd import refresh_opd_advantage, select_student_precision
 from verl.workers.config import ActorConfig
 
 __all__ = ["DataParallelPPOActor", "_compute_delta_opd_rm_scores"]
@@ -248,6 +248,7 @@ class DataParallelPPOActor(BasePPOActor):
             topk_ids: # (bs, response_len, k)
             topk_log_probs: # (bs, response_len, k)
         """
+        select_student_precision(self.actor_module, micro_batch)
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -564,6 +565,8 @@ class DataParallelPPOActor(BasePPOActor):
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "target_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if "student_bits" in data.non_tensor_batch:
+            non_tensor_select_keys.append("student_bits")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
         
@@ -885,6 +888,8 @@ class DataParallelPPOActor(BasePPOActor):
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if "student_bits" in data.non_tensor_batch:
+            non_tensor_select_keys.append("student_bits")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -1006,6 +1011,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if "student_bits" in data.non_tensor_batch:
+            non_tensor_select_keys.append("student_bits")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 

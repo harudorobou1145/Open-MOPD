@@ -76,6 +76,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.actor.mt_opd import (
     apply_teacher_conflict_policy,
     build_domain_weights,
+    build_precision_weights,
     compute_domain_loss_weights,
     compute_domain_share_metrics,
     compute_teacher_conflict_metrics,
@@ -662,6 +663,11 @@ class RayPPOTrainer:
             self.mt_teacher_domains: list[str] = list(OmegaConf.select(mt_opd_cfg, "teacher_domains") or [])
             self.mt_n_additional: int = int(OmegaConf.select(mt_opd_cfg, "n_additional_teachers") or 0)
             self.mt_domain_weighting: str = str(OmegaConf.select(mt_opd_cfg, "domain_weighting") or "domain_routing")
+            self.mt_teacher_bits = list(OmegaConf.select(mt_opd_cfg, "teacher_bits") or [])
+            if self.mt_domain_weighting == "precision_routing":
+                if len(self.mt_teacher_bits) != len(self.mt_teacher_domains):
+                    raise ValueError("mt_opd.teacher_bits must align with mt_opd.teacher_domains")
+                build_precision_weights(self.mt_teacher_bits, self.mt_teacher_bits, "cpu")
             if not self.mt_teacher_domains:
                 raise ValueError("reward_mode=mt_opd requires mt_opd.teacher_domains to be set")
             # M1: target *gradient* share per domain. Prompt weights cannot set this --
@@ -1147,7 +1153,8 @@ class RayPPOTrainer:
         # receives its own copy below in async mode, but MT-OPD still needs the
         # per-row domain after rollout when it selects the matching teacher.
         reward_model_keys = (
-            {"data_source", "reward_model", "extra_info", "uid", "domain"} & batch.non_tensor_batch.keys()
+            {"data_source", "reward_model", "extra_info", "uid", "domain", "student_bits"}
+            & batch.non_tensor_batch.keys()
         )
 
         # pop those keys for generation
@@ -1161,6 +1168,9 @@ class RayPPOTrainer:
         # For agent loop, we need reward model keys to compute score.
         if self.async_rollout_mode:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+
+        if "student_bits" in batch.non_tensor_batch:
+            gen_batch.non_tensor_batch["student_bits"] = batch.non_tensor_batch["student_bits"].copy()
 
         return gen_batch
 
@@ -1234,6 +1244,11 @@ class RayPPOTrainer:
             sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
+            anyprecision = self.config.actor_rollout_ref.model.get("anyprecision", None)
+            if anyprecision:
+                test_gen_batch.non_tensor_batch["student_bits"] = np.full(
+                    len(test_gen_batch), anyprecision.get("eval_bits", max(anyprecision.precisions)), dtype=np.int64
+                )
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -1699,6 +1714,13 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
+        from time import monotonic
+
+        time_budget = float(self.config.trainer.get("time_budget_seconds", 0) or 0)
+        if time_budget < 0:
+            raise ValueError("trainer.time_budget_seconds must be nonnegative")
+        budget_started = monotonic()
+
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -1871,6 +1893,7 @@ class RayPPOTrainer:
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                step_started = monotonic()
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1879,6 +1902,12 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+
+                anyprecision = self.config.actor_rollout_ref.model.get("anyprecision", None)
+                if anyprecision:
+                    precisions = list(anyprecision.precisions)
+                    batch = batch.repeat(repeat_times=len(precisions), interleave=True)
+                    batch.non_tensor_batch["student_bits"] = np.tile(precisions, len(batch) // len(precisions))
 
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
@@ -2107,7 +2136,7 @@ class RayPPOTrainer:
                                     }))
 
                                 domains = batch.non_tensor_batch.get("domain", None)
-                                if domains is None:
+                                if domains is None and self.mt_domain_weighting != "precision_routing":
                                     raise ValueError(
                                         "reward_mode=mt_opd requires non_tensor_batch['domain'] "
                                         "on the training batch"
@@ -2125,12 +2154,20 @@ class RayPPOTrainer:
                                         f"{len(self.mt_teacher_domains)} entries"
                                     )
 
-                                domain_weights = build_domain_weights(
-                                    domains=domains,
-                                    domain_order=self.mt_teacher_domains,
-                                    device=teacher_logps[0].device,
-                                    weighting=self.mt_domain_weighting,
-                                )
+                                if self.mt_domain_weighting == "precision_routing":
+                                    student_bits = batch.non_tensor_batch.get("student_bits")
+                                    domain_weights = build_precision_weights(
+                                        student_bits, self.mt_teacher_bits, teacher_logps[0].device
+                                    )
+                                    if domain_weights.shape[0] != teacher_logps[0].shape[0]:
+                                        raise ValueError("student_bits must have one entry per training sample")
+                                else:
+                                    domain_weights = build_domain_weights(
+                                        domains=domains,
+                                        domain_order=self.mt_teacher_domains,
+                                        device=teacher_logps[0].device,
+                                        weighting=self.mt_domain_weighting,
+                                    )
                                 routed_lp = select_routed_teacher_logprobs(
                                     teacher_logps, domain_weights
                                 )
@@ -3529,6 +3566,10 @@ class RayPPOTrainer:
                         metrics.update(actor_output_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                elapsed = monotonic() - budget_started
+                if time_budget and elapsed + max(self.max_steps_duration, monotonic() - step_started) >= time_budget:
+                    is_last_step = True
+                    print(f"Training time budget reached: {elapsed:.1f}s; saving after step {self.global_steps}.")
                 esi_close_to_expiration = should_save_ckpt_esi(
                     max_steps_duration=self.max_steps_duration,
                     redundant_time=self.config.trainer.esi_redundant_time,

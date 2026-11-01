@@ -61,11 +61,13 @@ def _load_parquet_dataset(parquet_file: str) -> datasets.Dataset:
     import pyarrow.parquet as pq
 
     try:
-        rows: list[dict] = []
+        dataframes = []
         parquet_reader = pq.ParquetFile(parquet_file)
         for batch in parquet_reader.iter_batches(batch_size=_PARQUET_READ_BATCH_ROWS):
-            rows.extend(batch.to_pylist())
-        return datasets.Dataset.from_list(rows)
+            dataframes.append(datasets.Dataset.from_list(batch.to_pylist()))
+        if not dataframes:
+            return datasets.Dataset.from_list([])
+        return datasets.concatenate_datasets(dataframes)
     except Exception as exc:
         exc_name = type(exc).__name__
         exc_text = str(exc)

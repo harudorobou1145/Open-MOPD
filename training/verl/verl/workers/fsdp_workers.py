@@ -313,10 +313,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             AutoModel,
             AutoModelForCausalLM,
             AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
         )
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.model import AutoModelForVision2Seq
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]
@@ -370,7 +370,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
         init_context = get_init_weight_context_manager(
-            use_meta_tensor=not actor_model_config.tie_word_embeddings, mesh=self.device_mesh
+            use_meta_tensor=not actor_model_config.tie_word_embeddings and not self.config.model.get("anyprecision"),
+            mesh=self.device_mesh,
         )
 
         with init_context(), warnings.catch_warnings():
@@ -464,6 +465,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "bias": "none",
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+        anyprecision = self.config.model.get("anyprecision", None)
+        if anyprecision and role == "actor":
+            if self.config.rollout.name not in ("hf", "vllm") or use_remove_padding or use_fused_kernels:
+                raise ValueError("AnyPrecision requires HF/compressed vLLM rollout, padded inputs and unfused kernels")
+            if self.config.rollout.name == "vllm":
+                engine = self.config.rollout.get("engine_kwargs", {}).get("vllm", {})
+                if engine.get("quantization") != "anyprecision" or self.config.rollout.load_format != "anyprecision":
+                    raise ValueError("AnyPrecision vLLM requires native compressed quantization and loader")
+            if self.config.actor.strategy != "fsdp" or not fsdp_config.get("use_orig_params", False):
+                raise ValueError("AnyPrecision requires FSDP with use_orig_params=True")
+            if self.ulysses_sequence_parallel_size != 1:
+                raise ValueError("AnyPrecision requires sequence parallel size 1")
+            if self.config.actor.use_dynamic_bsz or self.config.actor.ppo_micro_batch_size_per_gpu != 1:
+                raise ValueError("AnyPrecision requires fixed actor microbatches of size 1")
+            if self.config.rollout.name == "hf" and self.config.rollout.get("micro_batch_size", None) != 1:
+                raise ValueError("AnyPrecision requires rollout.micro_batch_size=1")
+            if self.world_size != 1 or self.config.rollout.mode != "sync":
+                raise ValueError("AnyPrecision currently supports single-GPU synchronous training only")
+            if self.config.rollout.log_prob_use_dynamic_bsz or self.config.rollout.log_prob_micro_batch_size_per_gpu != 1:
+                raise ValueError("AnyPrecision requires fixed log-probability microbatches of size 1")
+            if PrecisionType.to_dtype(fsdp_config.get("model_dtype", "fp32")) != torch.float32:
+                raise ValueError("AnyPrecision requires FP32 model initialization for shared trainable codebooks")
+            from any_precision.trainable import install_trainable_qwen
+
+            install_trainable_qwen(
+                actor_module, anyprecision.cache_path, precisions=tuple(anyprecision.precisions)
+            )
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -644,9 +673,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-        )
+        if rollout_name == "hf":
+            from verl.workers.rollout.hf_rollout import HFRollout
+
+            self.rollout = HFRollout(module=self.actor_module_fsdp, config=rollout_config)
+        else:
+            self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+            )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params
@@ -678,6 +712,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        if self.config.rollout.name == "hf":
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            return
         aggressive_empty_cache(force_sync=True)
 
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
@@ -698,6 +736,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
             params = self.actor_module_fsdp.state_dict()
+
+        if self.config.model.get("anyprecision", None):
+            params = {name: value.detach().cpu().clone() for name, value in params.items()
+                      if name.endswith((".delta", ".base_lut4", ".base_lut8"))}
 
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
@@ -778,6 +820,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
+        if self.config.rollout.name == "hf":
+            return
         if self.config.rollout.free_cache_engine:
             log_gpu_memory_usage("Before rollout offload", logger=logger)
             await self.rollout.release()
@@ -959,10 +1003,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
-            if self.generation_config is not None
+            if self.generation_config is not None and self.generation_config.eos_token_id is not None
             else self.tokenizer.eos_token_id,
             "pad_token_id": self.generation_config.pad_token_id
-            if self.generation_config is not None
+            if self.generation_config is not None and self.generation_config.pad_token_id is not None
             else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
@@ -1799,6 +1843,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             self.config.micro_batch_size_per_gpu = self.config.micro_batch_size
 
     def _build_model(self, config):
+        from verl.utils.torch_dtypes import PrecisionType
+
         # the following line is necessary
         from torch.distributed.fsdp import CPUOffload
         from transformers import AutoConfig, AutoModelForCausalLM
@@ -1819,6 +1865,30 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         trust_remote_code = config.model.get("trust_remote_code", False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+
+        if config.model.get("quantized_teacher", False):
+            if not getattr(model_config, "quantization_config", None):
+                raise ValueError("quantized_teacher requires a quantized checkpoint")
+            if config.model.get("use_remove_padding", False) or self.ulysses_sequence_parallel_size != 1:
+                raise ValueError("Quantized teachers require use_remove_padding=False and sequence parallel size 1")
+            if config.model.get("use_fused_kernels", False):
+                raise ValueError("Quantized teachers do not support the fused scoring path")
+            if config.model.get("quantization_backend", None):
+                model_config.quantization_config["backend"] = config.model.quantization_backend
+            model_class = AutoModelForCausalLM
+            if model_config.model_type == "qwen3_5":
+                from transformers import Qwen3_5ForConditionalGeneration
+
+                model_class = Qwen3_5ForConditionalGeneration
+            reward_module = model_class.from_pretrained(
+                local_path,
+                config=model_config,
+                torch_dtype=PrecisionType.to_dtype(config.model.get("dtype", "bf16")),
+                device_map={"": get_device_id()},
+                attn_implementation=config.model.get("attn_implementation", "sdpa"),
+                trust_remote_code=trust_remote_code,
+            )
+            return reward_module.eval().requires_grad_(False)
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         init_context = get_init_weight_context_manager(
