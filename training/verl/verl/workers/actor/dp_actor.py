@@ -43,7 +43,7 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.actor import BasePPOActor
-from verl.workers.actor.mt_opd import refresh_opd_advantage, select_student_precision
+from verl.workers.actor.mt_opd import refresh_opd_advantage, select_student_precision, split_precision_batches
 from verl.workers.config import ActorConfig
 
 __all__ = ["DataParallelPPOActor", "_compute_delta_opd_rm_scores"]
@@ -574,7 +574,7 @@ class DataParallelPPOActor(BasePPOActor):
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
-            micro_batches = data.split(micro_batch_size)
+            micro_batches, batch_idx_list = split_precision_batches(data, micro_batch_size)
 
         topk_log_probs_lst = []
         top_k = target_ids.shape[-1]
@@ -595,7 +595,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         topk_log_probs_tensor = torch.concat(topk_log_probs_lst, dim=0)
 
-        if use_dynamic_bsz:
+        if use_dynamic_bsz or "student_bits" in data.non_tensor_batch:
             topk_log_probs_tensor = restore_dynamic_batch(topk_log_probs_tensor, batch_idx_list)
 
         return topk_log_probs_tensor
@@ -630,6 +630,8 @@ class DataParallelPPOActor(BasePPOActor):
             has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
             select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
             non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+            if "student_bits" in data.non_tensor_batch:
+                non_tensor_select_keys.append("student_bits")
             
             # We need to pass target_ids to _forward_micro_batch, but since we are micro-batching, 
             # we should split target_ids as well.
@@ -640,7 +642,7 @@ class DataParallelPPOActor(BasePPOActor):
                 max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
                 micro_batches, batch_idx_list = prepare_dynamic_batch(mb_data, max_token_len=max_token_len)
             else:
-                micro_batches = mb_data.split(micro_batch_size)
+                micro_batches, batch_idx_list = split_precision_batches(mb_data, micro_batch_size)
 
             S_on_T_lst = []
             for micro_batch in micro_batches:
@@ -655,7 +657,7 @@ class DataParallelPPOActor(BasePPOActor):
                 S_on_T_lst.append(topk_log_probs)
 
             S_on_T = torch.concat(S_on_T_lst, dim=0)
-            if use_dynamic_bsz:
+            if use_dynamic_bsz or "student_bits" in data.non_tensor_batch:
                 S_on_T = restore_dynamic_batch(S_on_T, batch_idx_list)
         
         # 3. Compute rm_scores on GPU
@@ -897,7 +899,7 @@ class DataParallelPPOActor(BasePPOActor):
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
-            micro_batches = data.split(micro_batch_size)
+            micro_batches, batch_idx_list = split_precision_batches(data, micro_batch_size)
 
         top_k = data.meta_info.get("top_k", 0)
         print(f"In compute_log_prob, top_k: {top_k}")
@@ -936,7 +938,7 @@ class DataParallelPPOActor(BasePPOActor):
             topk_ids_tensor = torch.concat(topk_ids_lst, dim=0)
             topk_log_probs_tensor = torch.concat(topk_log_probs_lst, dim=0)
 
-        if use_dynamic_bsz:
+        if use_dynamic_bsz or "student_bits" in data.non_tensor_batch:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
@@ -1032,7 +1034,7 @@ class DataParallelPPOActor(BasePPOActor):
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    micro_batches, _ = split_precision_batches(mini_batch, self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
 
@@ -1066,7 +1068,7 @@ class DataParallelPPOActor(BasePPOActor):
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
-                        loss_scale_factor = 1 / self.gradient_accumulation
+                        loss_scale_factor = len(micro_batch) / len(mini_batch)
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False

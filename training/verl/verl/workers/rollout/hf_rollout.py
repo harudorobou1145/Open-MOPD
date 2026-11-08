@@ -30,7 +30,7 @@ from transformers import GenerationConfig
 from verl import DataProto
 from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.torch_functional import get_response_mask
-from verl.workers.actor.mt_opd import select_student_precision
+from verl.workers.actor.mt_opd import select_student_precision, split_precision_batches
 
 from .base import BaseRollout
 
@@ -53,10 +53,11 @@ class HFRollout(BaseRollout):
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
-        num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
-        batch_prompts = prompts.chunk(chunks=num_chunks)
+        batch_prompts, groups = split_precision_batches(prompts, self.config.get("micro_batch_size", batch_size))
         output = [self._generate_minibatch(p) for p in batch_prompts]
         output = DataProto.concat(output)
+        order = [index for group in groups for index in group]
+        output.reorder(torch.tensor(sorted(range(len(order)), key=order.__getitem__)))
         return output
 
     @torch.no_grad()

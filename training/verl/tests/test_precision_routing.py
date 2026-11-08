@@ -3,7 +3,7 @@ import ast
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import unittest
 
 import numpy as np
@@ -17,6 +17,130 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PrecisionRoutingTests(unittest.TestCase):
+    def test_precision_loss_weights(self):
+        bits = [8, 4, 8, 4]
+        self.assertIsNone(MODULE.build_precision_loss_weights(bits, [4, 8], None, "cpu"))
+        torch.testing.assert_close(
+            MODULE.build_precision_loss_weights(bits, [4, 8], [1, 1], "cpu"), torch.ones(4))
+        actual = MODULE.build_precision_loss_weights(bits, [4, 8], [1, 2], "cpu")
+        torch.testing.assert_close(actual, torch.tensor([4 / 3, 2 / 3, 4 / 3, 2 / 3]))
+        parameter = torch.tensor(1.0, requires_grad=True)
+        (parameter * actual * torch.tensor([3., 6., 3., 6.])).mean().backward()
+        self.assertAlmostEqual(parameter.grad.item(), 4.0)
+        for invalid in ([1], [1, 0], [-1, 2], [1, float("nan")], [1, float("inf")]):
+            with self.subTest(weights=invalid), self.assertRaises(ValueError):
+                MODULE.build_precision_loss_weights(bits, [4, 8], invalid, "cpu")
+
+    def test_precision_loss_weights_trainer_hook(self):
+        trainer_source = SOURCE.parents[2] / "trainer/ppo/ray_trainer.py"
+        tree = ast.parse(trainer_source.read_text())
+        branch = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "self.mt_precision_loss_weights is not None")
+        weight_branch = next(node for node in ast.walk(tree)
+                             if isinstance(node, ast.If) and ast.unparse(node.test) == "dom_w is not None"
+                             and any(isinstance(child, ast.Constant) and child.value == "domain_loss_weight"
+                                     for child in ast.walk(node)))
+        code = compile(ast.Module(body=[branch, weight_branch], type_ignores=[]), str(trainer_source), "exec")
+        for existing in (None, torch.tensor([0.5, 2.0])):
+            for domains in (None, np.array(["int4", "int8"])):
+                namespace = dict(
+                    self=SimpleNamespace(mt_precision_loss_weights=[1, 2], mt_teacher_bits=[4, 8]),
+                    batch=SimpleNamespace(non_tensor_batch={"student_bits": np.array([4, 8])}, batch={}),
+                    response_mask=torch.ones(2, 3), dom_w=existing, metrics={}, torch=torch, np=np,
+                    domains=domains,
+                    build_precision_loss_weights=MODULE.build_precision_loss_weights,
+                )
+                exec(code, namespace)
+                expected = torch.tensor([2 / 3, 4 / 3])
+                if existing is not None:
+                    expected = expected * existing
+                torch.testing.assert_close(namespace["dom_w"], expected)
+                torch.testing.assert_close(namespace["batch"].batch["domain_loss_weight"], expected)
+                self.assertAlmostEqual(namespace["metrics"]["mt_opd/precision/w8/loss_weight"], 4 / 3)
+                if domains is not None:
+                    self.assertAlmostEqual(namespace["metrics"]["mt_opd/domain/int8/loss_weight"], expected[1].item())
+
+    def test_precision_teacher_scoring_matches_full_routing(self):
+        from verl import DataProto
+
+        data = DataProto.from_dict(tensors={"marker": torch.arange(6)},
+                                   non_tensors={"student_bits": np.array([8, 4, 8, 4, 8, 4])})
+        sparse = []
+        full = []
+        for bits in (4, 8):
+            seen = []
+
+            def score(batch):
+                seen.extend(batch.non_tensor_batch["student_bits"].tolist())
+                values = (batch.batch["marker"] + bits).float().view(-1, 1, 1)
+                return DataProto.from_dict(tensors={"teacher_on_student_log_probs": values})
+
+            worker = SimpleNamespace(world_size=2, compute_rm_score=score)
+            actual = MODULE.score_precision_teacher(worker, data, bits)
+            self.assertEqual(seen, [bits] * 4)
+            sparse.append(actual.batch["teacher_on_student_log_probs"])
+            full.append((data.batch["marker"] + bits).float().view(-1, 1, 1))
+        weights = MODULE.build_precision_weights(data.non_tensor_batch["student_bits"], [4, 8], "cpu")
+        torch.testing.assert_close(MODULE.select_routed_teacher_logprobs(sparse, weights),
+                                   MODULE.select_routed_teacher_logprobs(full, weights))
+
+    def test_precision_per_gpu_generation_order(self):
+        from tensordict import TensorDict
+        from verl import DataProto
+
+        trainer_source = SOURCE.parents[2] / "trainer/ppo/ray_trainer.py"
+        tree = ast.parse(trainer_source.read_text())
+        branch = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.If) and ast.unparse(node.test) == "not self.async_rollout_mode"
+                      and any(isinstance(child, ast.Name) and child.id == "precision_order"
+                              for child in ast.walk(node)))
+        code = compile(ast.Module(body=branch.body, type_ignores=[]), str(trainer_source), "exec")
+        for enabled in (False, True):
+            data = DataProto(batch=TensorDict({"marker": torch.arange(4).repeat_interleave(2)}, batch_size=8),
+                             non_tensor_batch={"student_bits": np.tile([4, 8], 4)})
+
+            def generate(batch):
+                if enabled:
+                    self.assertEqual(batch.non_tensor_batch["student_bits"].tolist(), [4] * 4 + [8] * 4)
+                    self.assertEqual(batch.batch["marker"].tolist(), list(range(4)) * 2)
+                batch.batch["response_marker"] = batch.batch["marker"] * 10 + torch.tensor(
+                    batch.non_tensor_batch["student_bits"])
+                return batch
+
+            trainer = SimpleNamespace(config=SimpleNamespace(trainer=SimpleNamespace(
+                get=lambda key, default: enabled, n_gpus_per_node=2, nnodes=1)),
+                actor_rollout_wg=SimpleNamespace(generate_sequences=generate))
+            namespace = dict(self=trainer, gen_batch_output=data, np=np, torch=torch)
+            exec(code, namespace)
+            self.assertEqual(namespace["gen_batch_output"].batch["response_marker"].tolist(),
+                             [4, 8, 14, 18, 24, 28, 34, 38])
+
+    def test_teacher_entropy_noncontiguous_batch(self):
+        from verl.workers.fsdp_workers import RewardModelWorker
+
+        logits = torch.randn(2, 8, 11)[:, 2:6, :]
+        self.assertFalse(logits.is_contiguous())
+        actual = RewardModelWorker._compute_entropy_safe(None, logits, chunk_size=3)
+        expected = torch.distributions.Categorical(logits=logits).entropy()
+        torch.testing.assert_close(actual, expected)
+
+    def test_precision_microbatches_restore_order(self):
+        from tensordict import TensorDict
+        from verl import DataProto
+        from verl.workers.rollout.hf_rollout import HFRollout
+
+        data = DataProto(batch=TensorDict({"marker": torch.arange(6)}, batch_size=6),
+                         non_tensor_batch={"student_bits": np.array([8, 4, 8, 4, 8, 4])})
+        batches, groups = MODULE.split_precision_batches(data, 2)
+        self.assertEqual(groups, [[1, 3], [5], [0, 2], [4]])
+        self.assertTrue(all(len(set(batch.non_tensor_batch["student_bits"])) == 1 for batch in batches))
+        rollout = HFRollout(None, {"micro_batch_size": 2})
+        rollout._generate_minibatch = lambda batch: batch
+        result = rollout.generate_sequences(data)
+        self.assertEqual(result.batch["marker"].tolist(), list(range(6)))
+        self.assertEqual(result.non_tensor_batch["student_bits"].tolist(), [8, 4, 8, 4, 8, 4])
+
     def test_training_time_budget_final_checkpoint(self):
         trainer_source = SOURCE.parents[2] / "trainer/ppo/ray_trainer.py"
         tree = ast.parse(trainer_source.read_text())
@@ -88,7 +212,13 @@ class PrecisionRoutingTests(unittest.TestCase):
         from verl.workers.rollout.hf_rollout import HFRollout
 
         with tempfile.TemporaryDirectory() as directory:
-            torch.distributed.init_process_group("nccl", init_method=f"file://{directory}/init", rank=0, world_size=1)
+            distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            torch.cuda.set_device(local_rank)
+            if distributed:
+                torch.distributed.init_process_group("nccl")
+            else:
+                torch.distributed.init_process_group("nccl", init_method=f"file://{directory}/init", rank=0, world_size=1)
             try:
                 model_path = "/workspace/my_project/models/Qwen3.5-0.8B"
                 cache = ("/workspace/my_project/outputs/anyprecision_qwen35_08b/mlp_seed4_parent8_s0/"
@@ -97,44 +227,56 @@ class PrecisionRoutingTests(unittest.TestCase):
                     model_path, dtype=torch.float32, attn_implementation="sdpa")
                 install_trainable_qwen(model, cache, precisions=(4, 8))
                 model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-                model = FSDP(model, use_orig_params=True, device_id=0)
+                model = FSDP(model, use_orig_params=True, device_id=local_rank, sync_module_states=True)
                 parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
                 optimizer = torch.optim.AdamW(parameters, lr=1e-4)
                 step = Mock(wraps=optimizer.step)
                 optimizer.step = step
-                config = FSDPActorConfig(ppo_mini_batch_size=2, ppo_micro_batch_size_per_gpu=1,
+                microbatch = 2
+                config = FSDPActorConfig(ppo_mini_batch_size=4, ppo_micro_batch_size_per_gpu=microbatch,
                                          use_torch_compile=False, use_remove_padding=False)
                 actor = DataParallelPPOActor(config, model, optimizer)
                 tokenizer = AutoTokenizer.from_pretrained(model_path)
                 inputs = tokenizer("Two plus two equals four.", return_tensors="pt").to("cuda")
-                tensors = {key: value.repeat(2, 1) for key, value in inputs.items()}
-                tensors["position_ids"] = torch.arange(tensors["input_ids"].shape[1], device="cuda")[None].repeat(2, 1)
+                tensors = {key: value.repeat(4, 1) for key, value in inputs.items()}
+                tensors["position_ids"] = torch.arange(tensors["input_ids"].shape[1], device="cuda")[None].repeat(4, 1)
                 tensors["responses"] = tensors["input_ids"][:, -2:]
-                tensors["response_mask"] = torch.ones((2, 2), device="cuda")
-                data = DataProto(batch=TensorDict(tensors, batch_size=2),
-                                 non_tensor_batch={"student_bits": np.array([4, 8])},
+                tensors["response_mask"] = torch.ones((4, 2), device="cuda")
+                bits = [4, 4, 4, 4] if distributed and local_rank == 0 else [4, 8, 8, 8]
+                data = DataProto(batch=TensorDict(tensors, batch_size=4),
+                                 non_tensor_batch={"student_bits": np.array(bits)},
                                  meta_info={"micro_batch_size": 1, "temperature": 1.0, "use_dynamic_bsz": False})
                 old, *_ = actor.compute_log_prob(data)
+                data.meta_info["micro_batch_size"] = microbatch
+                batched, *_ = actor.compute_log_prob(data)
+                torch.testing.assert_close(old, batched, atol=0.02, rtol=0.02)
                 data.batch["old_log_probs"] = old
                 data.batch["advantages"] = torch.ones_like(old)
-                rollout = HFRollout(model, RolloutConfig(name="hf", micro_batch_size=1, response_length=2))
+                rollout = HFRollout(model, RolloutConfig(name="hf", micro_batch_size=microbatch, response_length=2))
                 prompts = DataProto(batch=TensorDict({key: tensors[key] for key in
-                                    ("input_ids", "attention_mask", "position_ids")}, batch_size=2),
-                                    non_tensor_batch={"student_bits": np.array([4, 8])},
+                                    ("input_ids", "attention_mask", "position_ids")}, batch_size=4),
+                                    non_tensor_batch={"student_bits": np.array(bits)},
                                     meta_info={"eos_token_id": tokenizer.eos_token_id,
                                                "pad_token_id": tokenizer.pad_token_id, "do_sample": False})
                 generated = rollout.generate_sequences(prompts)
-                self.assertEqual(tuple(generated.batch["responses"].shape), (2, 2))
+                self.assertEqual(tuple(generated.batch["responses"].shape), (4, 2))
                 prompts.batch["position_ids"] = prompts.batch["position_ids"].unsqueeze(1).expand(-1, 4, -1)
                 generated = rollout.generate_sequences(prompts)
                 self.assertEqual(tuple(generated.batch["position_ids"].shape),
-                                 (2, 4, tensors["input_ids"].shape[-1] + 2))
-                before = [parameter.detach().clone() for parameter in parameters]
+                                 (4, 4, tensors["input_ids"].shape[-1] + 2))
+                with FSDP.summon_full_params(model):
+                    before = [parameter.detach().clone() for parameter in parameters]
                 metrics = actor.update_policy(data)
                 self.assertEqual(step.call_count, 1)
-                self.assertTrue(all(torch.isfinite(parameter).all() for parameter in parameters))
-                self.assertTrue(any(not torch.equal(initial, parameter)
-                                    for initial, parameter in zip(before, parameters, strict=True)))
+                with FSDP.summon_full_params(model):
+                    self.assertTrue(all(torch.isfinite(parameter).all() for parameter in parameters))
+                    self.assertTrue(any(not torch.equal(initial, parameter)
+                                        for initial, parameter in zip(before, parameters, strict=True)))
+                    if distributed:
+                        for parameter in parameters:
+                            reference = parameter.detach().clone()
+                            torch.distributed.broadcast(reference, src=0)
+                            torch.testing.assert_close(parameter, reference, atol=0, rtol=0)
                 self.assertTrue(np.isfinite(metrics["actor/grad_norm"]).all())
             finally:
                 torch.distributed.destroy_process_group()
@@ -152,8 +294,11 @@ class PrecisionRoutingTests(unittest.TestCase):
         inputs = tokenizer("Two plus two equals four.", return_tensors="pt").to("cuda")
         inputs["position_ids"] = torch.arange(inputs["input_ids"].shape[1], device="cuda")[None]
         inputs["responses"] = inputs["input_ids"][:, -2:]
-        for name, dtype, backend in (("Qwen3.5-0.8B-W4A16-AutoRound-AWQ", "fp16", "torch_awq"),
-                                     ("Qwen3.5-0.8B-W8A16", "bf16", None)):
+        gptq_teacher = os.environ.get("MOPD_GPTQ_TEACHER")
+        teachers = (("Qwen3.5-0.8B-W4A16-AutoRound-AWQ", "fp16", "torch_awq"),
+                (gptq_teacher or "Qwen3.5-0.8B-W8A16",
+                 "fp16" if gptq_teacher else "bf16", "torch" if gptq_teacher else None))
+        for name, dtype, backend in teachers:
             teacher_tokenizer = AutoTokenizer.from_pretrained(root / name)
             vocabulary = teacher_tokenizer.get_vocab()
             self.assertTrue(all(vocabulary.get(token) == index for token, index in tokenizer.get_vocab().items()))
@@ -170,14 +315,18 @@ class PrecisionRoutingTests(unittest.TestCase):
             output = worker._forward_micro_batch(inputs)
             self.assertTrue(torch.isfinite(output[0]).all())
             self.assertEqual(tuple(output[0].shape), (1, 2))
+            sampled_log_probs = output[0].clone()
             ids = inputs["responses"].unsqueeze(-1)
             output = worker._forward_micro_batch(inputs, student_top_k_ids=ids, top_k=1)
             self.assertTrue(torch.isfinite(output[1]).all())
+            torch.testing.assert_close(output[1].squeeze(-1), sampled_log_probs)
             del worker, output
             gc.collect()
             torch.cuda.empty_cache()
 
     def test_quantized_teacher_loading_branch(self):
+        from omegaconf import OmegaConf
+
         path = SOURCE.parents[2] / "workers/fsdp_workers.py"
         tree = ast.parse(path.read_text())
         worker = next(node for node in tree.body if isinstance(node, ast.ClassDef)
@@ -195,7 +344,7 @@ class PrecisionRoutingTests(unittest.TestCase):
         model.requires_grad_.return_value = model
         loader = Mock()
         loader.from_pretrained.return_value = model
-        options = {"quantized_teacher": True}
+        options = OmegaConf.create({"quantized_teacher": True})
         namespace = {"config": SimpleNamespace(model=options),
                      "model_config": SimpleNamespace(quantization_config={"bits": 8}, model_type="qwen3_5_text"),
                      "self": SimpleNamespace(ulysses_sequence_parallel_size=1),
@@ -212,6 +361,15 @@ class PrecisionRoutingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 namespace["probe"]()
             options[option] = False
+        gptq_loader = Mock()
+        gptq_loader.load.return_value.model = model
+        namespace["model_config"].quantization_config["quant_method"] = "gptq"
+        options["quantization_backend"] = "torch"
+        with patch.dict("sys.modules", {"gptqmodel": SimpleNamespace(GPTQModel=gptq_loader)}):
+            self.assertIs(namespace["probe"](), model)
+        self.assertEqual(gptq_loader.load.call_args.kwargs["backend"], "torch")
+        self.assertEqual(gptq_loader.load.call_args.kwargs["device_map"], {"": 0})
+        self.assertEqual(loader.from_pretrained.call_count, 1)
 
     def test_generation_preserves_precision_metadata(self):
         path = SOURCE.parents[2] / "trainer/ppo/ray_trainer.py"

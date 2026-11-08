@@ -478,14 +478,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 raise ValueError("AnyPrecision requires FSDP with use_orig_params=True")
             if self.ulysses_sequence_parallel_size != 1:
                 raise ValueError("AnyPrecision requires sequence parallel size 1")
-            if self.config.actor.use_dynamic_bsz or self.config.actor.ppo_micro_batch_size_per_gpu != 1:
-                raise ValueError("AnyPrecision requires fixed actor microbatches of size 1")
-            if self.config.rollout.name == "hf" and self.config.rollout.get("micro_batch_size", None) != 1:
-                raise ValueError("AnyPrecision requires rollout.micro_batch_size=1")
-            if self.world_size != 1 or self.config.rollout.mode != "sync":
-                raise ValueError("AnyPrecision currently supports single-GPU synchronous training only")
-            if self.config.rollout.log_prob_use_dynamic_bsz or self.config.rollout.log_prob_micro_batch_size_per_gpu != 1:
-                raise ValueError("AnyPrecision requires fixed log-probability microbatches of size 1")
+            if self.config.actor.use_dynamic_bsz or self.config.actor.ppo_micro_batch_size_per_gpu < 1:
+                raise ValueError("AnyPrecision requires positive fixed actor microbatches")
+            if self.config.rollout.name == "hf" and self.config.rollout.get("micro_batch_size", 0) < 1:
+                raise ValueError("AnyPrecision requires a positive rollout.micro_batch_size")
+            if self.world_size not in (1, 2) or self.config.rollout.mode != "sync":
+                raise ValueError("AnyPrecision supports one or two GPUs with synchronous training")
+            if self.config.rollout.log_prob_use_dynamic_bsz or self.config.rollout.log_prob_micro_batch_size_per_gpu < 1:
+                raise ValueError("AnyPrecision requires positive fixed log-probability microbatches")
             if PrecisionType.to_dtype(fsdp_config.get("model_dtype", "fp32")) != torch.float32:
                 raise ValueError("AnyPrecision requires FP32 model initialization for shared trainable codebooks")
             from any_precision.trainable import install_trainable_qwen
@@ -734,12 +734,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+        elif self.config.model.get("anyprecision", None):
+            with FSDP.summon_full_params(self.actor_module_fsdp, writeback=False):
+                params = {name: value.detach().cpu().clone()
+                          for name, value in self.actor_module_fsdp.module.state_dict().items()
+                          if name.endswith((".delta", ".base_lut4", ".base_lut8"))}
         else:
             params = self.actor_module_fsdp.state_dict()
-
-        if self.config.model.get("anyprecision", None):
-            params = {name: value.detach().cpu().clone() for name, value in params.items()
-                      if name.endswith((".delta", ".base_lut4", ".base_lut8"))}
 
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
@@ -1875,6 +1876,18 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 raise ValueError("Quantized teachers do not support the fused scoring path")
             if config.model.get("quantization_backend", None):
                 model_config.quantization_config["backend"] = config.model.quantization_backend
+            if model_config.quantization_config.get("quant_method") == "gptq":
+                from gptqmodel import GPTQModel
+
+                reward_module = GPTQModel.load(
+                    local_path,
+                    backend=config.model.get("quantization_backend", "torch"),
+                    torch_dtype=PrecisionType.to_dtype(config.model.get("dtype", "bf16")),
+                    device_map={"": get_device_id()},
+                    attn_implementation=config.model.get("attn_implementation", "sdpa"),
+                    trust_remote_code=trust_remote_code,
+                ).model
+                return reward_module.eval().requires_grad_(False)
             model_class = AutoModelForCausalLM
             if model_config.model_type == "qwen3_5":
                 from transformers import Qwen3_5ForConditionalGeneration
@@ -1961,7 +1974,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         vocab_size = original_shape[-1]
         
         # Flatten to [-1, vocab_size]
-        logits_flat = logits.view(-1, vocab_size)
+        logits_flat = logits.reshape(-1, vocab_size)
         
         entropy_list = []
         for i in range(0, logits_flat.size(0), chunk_size):

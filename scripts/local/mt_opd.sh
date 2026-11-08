@@ -20,9 +20,11 @@ USAGE
 
 local_init
 local_parse_common "$@"
+# ANYPRECISION_CACHE enables shared-codebook training when nonempty.
 if [[ -n "${ANYPRECISION_CACHE:-}" ]]; then
     LOCAL_DOMAINS="int4,int8"
-    [[ "$LOCAL_GPUS" == 1 && "$LOCAL_NODES" == 1 ]] || local_die "AnyPrecision currently requires one GPU"
+    [[ "$LOCAL_GPUS" =~ ^[12]$ && "$LOCAL_NODES" == 1 ]] || local_die "AnyPrecision requires one or two GPUs on one node"
+    # ANYPRECISION_REPO locates the plugin; preserve existing PYTHONPATH entries.
     export PYTHONPATH="${ANYPRECISION_REPO:-${LOCAL_REPO_ROOT}/../any-precision-llm}:${PYTHONPATH:-}"
 fi
 local_scope_output mt_opd
@@ -31,20 +33,28 @@ if ((LOCAL_HELP)); then
     exit 0
 fi
 
+# TEACHER_MODEL_PATHS: comma-separated teacher paths, used when --teacher is absent.
 if ((${#LOCAL_TEACHER_PATHS[@]} == 0)) && [[ -n "${TEACHER_MODEL_PATHS:-}" ]]; then
     IFS=',' read -r -a LOCAL_TEACHER_PATHS <<< "${TEACHER_MODEL_PATHS}"
 fi
+# REWARD_MODEL_PATH: legacy single-teacher fallback after TEACHER_MODEL_PATHS.
 if ((${#LOCAL_TEACHER_PATHS[@]} == 0)) && [[ -n "${REWARD_MODEL_PATH:-}" ]]; then
     LOCAL_TEACHER_PATHS+=("${REWARD_MODEL_PATH}")
 fi
+# TEACHER_PATH: final legacy fallback; real MT-OPD runs still require two teachers.
 if ((${#LOCAL_TEACHER_PATHS[@]} == 0)) && [[ -n "${TEACHER_PATH:-}" ]]; then
     LOCAL_TEACHER_PATHS+=("${TEACHER_PATH}")
 fi
 
+# Global original prompt count per rollout batch (direct default: 1).
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
+# Prompt token limit before generation (direct default: 1024).
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
+# Generated response token limit (direct default: 2048; WikiText wrapper sets 128).
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
+# Independent responses sampled per prompt and precision (default: 1).
 N_RESPONSES="${N_RESPONSES:-1}"
+# Number of dataset passes (default: 1).
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 
 local_export_runtime
@@ -100,6 +110,7 @@ cmd=(
     "trainer.nnodes=${LOCAL_NODES}"
     "trainer.total_epochs=${TOTAL_EPOCHS}"
     "trainer.default_local_dir=${LOCAL_CHECKPOINT_DIR}"
+    # PROJECT_NAME groups experiment logs; EXPERIMENT_NAME labels this run.
     "trainer.project_name=${PROJECT_NAME:-OpenOPD-local}"
     "trainer.experiment_name=${EXPERIMENT_NAME:-mt-opd-local}"
     "trainer.logger=['console']"
@@ -153,9 +164,11 @@ if [[ -n "${ANYPRECISION_CACHE:-}" ]]; then
         "+mt_opd.domain_weighting=precision_routing"
         "+mt_opd.teacher_bits=[4,8]"
     )
+    # ANYPRECISION_ROLLOUT chooses hf or vllm; direct default is hf.
     case "${ANYPRECISION_ROLLOUT:-hf}" in
         hf) ;;
         vllm)
+            # Run vLLM in-process so actor-to-engine codebook updates share the worker.
             export VLLM_ENABLE_V1_MULTIPROCESSING=0
             cmd+=(
                 "actor_rollout_ref.rollout.name=vllm"
@@ -163,7 +176,8 @@ if [[ -n "${ANYPRECISION_CACHE:-}" ]]; then
                 "actor_rollout_ref.rollout.dtype=float16"
                 "actor_rollout_ref.rollout.enforce_eager=True"
                 "actor_rollout_ref.rollout.enable_prefix_caching=False"
-                "actor_rollout_ref.rollout.free_cache_engine=False"
+                "actor_rollout_ref.rollout.free_cache_engine=True"
+                "actor_rollout_ref.rollout.gpu_memory_utilization=0.3"
                 "+actor_rollout_ref.rollout.engine_kwargs.vllm.quantization=anyprecision"
                 "+actor_rollout_ref.rollout.engine_kwargs.vllm.model_loader_extra_config.cache_path='${ANYPRECISION_CACHE}'"
                 "+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image=0"

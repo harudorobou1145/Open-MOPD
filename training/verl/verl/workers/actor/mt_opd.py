@@ -13,6 +13,7 @@ import torch
 
 __all__ = [
     "build_precision_weights",
+    "build_precision_loss_weights",
     "build_domain_weights",
     "select_routed_teacher_logprobs",
     "compute_domain_share_metrics",
@@ -20,6 +21,56 @@ __all__ = [
     "compute_domain_loss_weights",
     "apply_teacher_conflict_policy",
 ]
+
+
+def score_precision_teacher(worker, data, teacher_bits):
+    from verl import DataProto
+    from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+
+    bits = data.non_tensor_batch.get("student_bits")
+    if bits is None or len(bits) != len(data):
+        raise ValueError("Precision teacher scoring requires student_bits per sample")
+    indices = np.flatnonzero(np.asarray(bits) == teacher_bits)
+    if len(indices) == 0:
+        raise ValueError(f"No samples for W{teacher_bits} teacher")
+    selected, padding = pad_dataproto_to_divisor(data.select_idxs(indices), worker.world_size)
+    output = unpad_dataproto(worker.compute_rm_score(selected), padding)
+    tensors = {}
+    for name, value in output.batch.items():
+        restored = value.new_zeros((len(data), *value.shape[1:]))
+        restored.index_copy_(0, torch.as_tensor(indices, device=value.device), value)
+        tensors[name] = restored
+    return DataProto.from_dict(tensors=tensors)
+
+
+def split_precision_batches(data, micro_batch_size):
+    if micro_batch_size <= 0:
+        raise ValueError("micro_batch_size must be positive")
+    bits = data.non_tensor_batch.get("student_bits")
+    if bits is None:
+        indices = np.arange(len(data))
+        groups = [indices[start:start + micro_batch_size].tolist()
+                  for start in range(0, len(data), micro_batch_size)]
+    else:
+        if len(bits) != len(data) or any(isinstance(value, (bool, np.bool_))
+                                       or not isinstance(value, (int, np.integer)) for value in bits):
+            raise ValueError("student_bits must contain one integer per sample")
+        groups = []
+        for precision in sorted(set(bits)):
+            indices = np.flatnonzero(np.asarray(bits) == precision)
+            groups.extend(indices[start:start + micro_batch_size].tolist()
+                          for start in range(0, len(indices), micro_batch_size))
+    if bits is not None:
+        import torch
+
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            counts = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(counts, (len(data), len(groups)))
+            if len({count[0] for count in counts}) != 1:
+                raise ValueError("Distributed precision batches require equal sample counts on all ranks")
+            if len({count[1] for count in counts}) != 1:
+                groups = [[index] for group in groups for index in group]
+    return [data.select_idxs(indices) for indices in groups], groups
 
 
 def select_student_precision(model, metadata):
@@ -65,6 +116,20 @@ def build_precision_weights(student_bits, teacher_bits, device):
         raise ValueError(f"No teacher configured for student bit widths: {sorted(unknown)}")
     indices = torch.tensor([teachers.index(bits) for bits in students], device=device)
     return torch.nn.functional.one_hot(indices, num_classes=len(teachers)).float()
+
+
+def build_precision_loss_weights(student_bits, teacher_bits, loss_weights, device):
+    if loss_weights is None:
+        return None
+    routing = build_precision_weights(student_bits, teacher_bits, device)
+    weights = torch.as_tensor(list(loss_weights), dtype=torch.float32, device=device)
+    if weights.ndim != 1 or weights.numel() != len(teacher_bits):
+        raise ValueError("precision_loss_weights must align with teacher_bits")
+    if not torch.isfinite(weights).all() or not (weights > 0).all():
+        raise ValueError("precision_loss_weights must be finite and positive")
+    weights = weights / weights.max()
+    weights = weights / weights.mean()
+    return routing @ weights
 
 
 def build_domain_weights(

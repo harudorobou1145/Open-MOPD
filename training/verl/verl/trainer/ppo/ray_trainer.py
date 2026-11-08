@@ -76,6 +76,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.actor.mt_opd import (
     apply_teacher_conflict_policy,
     build_domain_weights,
+    build_precision_loss_weights,
     build_precision_weights,
     compute_domain_loss_weights,
     compute_domain_share_metrics,
@@ -664,10 +665,16 @@ class RayPPOTrainer:
             self.mt_n_additional: int = int(OmegaConf.select(mt_opd_cfg, "n_additional_teachers") or 0)
             self.mt_domain_weighting: str = str(OmegaConf.select(mt_opd_cfg, "domain_weighting") or "domain_routing")
             self.mt_teacher_bits = list(OmegaConf.select(mt_opd_cfg, "teacher_bits") or [])
+            self.mt_precision_loss_weights = mt_opd_cfg.get("precision_loss_weights", None)
+            if self.mt_precision_loss_weights is not None and self.mt_domain_weighting != "precision_routing":
+                raise ValueError("precision_loss_weights requires precision_routing")
             if self.mt_domain_weighting == "precision_routing":
                 if len(self.mt_teacher_bits) != len(self.mt_teacher_domains):
                     raise ValueError("mt_opd.teacher_bits must align with mt_opd.teacher_domains")
                 build_precision_weights(self.mt_teacher_bits, self.mt_teacher_bits, "cpu")
+                build_precision_loss_weights(
+                    self.mt_teacher_bits, self.mt_teacher_bits, self.mt_precision_loss_weights, "cpu"
+                )
             if not self.mt_teacher_domains:
                 raise ValueError("reward_mode=mt_opd requires mt_opd.teacher_domains to be set")
             # M1: target *gradient* share per domain. Prompt weights cannot set this --
@@ -1927,7 +1934,19 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
+                            precision_order = None
+                            if self.config.trainer.get("precision_per_gpu", False):
+                                bits = gen_batch_output.non_tensor_batch.get("student_bits")
+                                if (self.config.trainer.n_gpus_per_node != 2
+                                        or self.config.trainer.nnodes != 1 or bits is None
+                                        or set(bits) != {4, 8}
+                                        or np.count_nonzero(bits == 4) != np.count_nonzero(bits == 8)):
+                                    raise ValueError("precision_per_gpu requires two GPUs and equal W4/W8 task counts")
+                                precision_order = np.argsort(bits, kind="stable")
+                                gen_batch_output.reorder(torch.as_tensor(precision_order))
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            if precision_order is not None:
+                                gen_batch_output.reorder(torch.as_tensor(np.argsort(precision_order)))
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
@@ -2015,8 +2034,19 @@ class RayPPOTrainer:
                             batch.meta_info["reward_mode"] = reward_mode
                             batch.meta_info["top_p_intersec_p"] = self.config.actor_rollout_ref.rollout.get("top_p_intersec_p", 0.99)
                             
+                            precision_teacher_scoring = (
+                                reward_mode == "mt_opd"
+                                and self.mt_domain_weighting == "precision_routing"
+                                and self.mt_conflict_policy == "none"
+                                and self.config.mt_opd.get("precision_teacher_scoring", True)
+                            )
+                            from verl.workers.actor.mt_opd import score_precision_teacher
+
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
-                                teacher_data = self.rm_wg.compute_rm_score(batch)
+                                teacher_data = (
+                                    score_precision_teacher(self.rm_wg, batch, self.mt_teacher_bits[0])
+                                    if precision_teacher_scoring else self.rm_wg.compute_rm_score(batch)
+                                )
                                 batch = batch.union(teacher_data)
 
                             if reward_mode in ("delta_opd", "exopd"):
@@ -2130,7 +2160,12 @@ class RayPPOTrainer:
                                 # --- MT-OPD: route per-domain RL teacher, then standard OPD distillation ---
                                 for i, extra_wg in enumerate(self.mt_rm_wgs, start=1):
                                     with marked_timer(f"compute_mt_rm_{i}_score", timing_raw, color="magenta"):
-                                        extra_raw = extra_wg.compute_rm_score(batch)
+                                        extra_raw = (
+                                            score_precision_teacher(extra_wg, batch, self.mt_teacher_bits[i])
+                                            if precision_teacher_scoring else extra_wg.compute_rm_score(batch)
+                                        )
+                                    if precision_teacher_scoring and "teacher_entropy" in extra_raw.batch:
+                                        batch.batch["teacher_entropy"] += extra_raw.batch["teacher_entropy"]
                                     batch = batch.union(DataProto.from_dict(tensors={
                                         f"mt_teacher_{i}_on_student_log_probs": extra_raw.batch["teacher_on_student_log_probs"],
                                     }))
@@ -2211,13 +2246,15 @@ class RayPPOTrainer:
                                         rm_scores=batch.batch["rm_scores"],
                                     )
                                 )
-                                metrics.update(
-                                    compute_teacher_conflict_metrics(
-                                        teacher_logprobs=teacher_logps,
-                                        response_mask=response_mask,
-                                        domains=domains,
+                                if not precision_teacher_scoring:
+                                    metrics.update(
+                                        compute_teacher_conflict_metrics(
+                                            teacher_logprobs=teacher_logps,
+                                            response_mask=response_mask,
+                                            domains=domains,
+                                        )
                                     )
-                                )
+                                metrics["mt_opd/precision_teacher_scoring"] = int(precision_teacher_scoring)
 
                                 # M1: rebalance gradient share across domains. Computed
                                 # here because this is where domain labels live, and
@@ -2257,9 +2294,24 @@ class RayPPOTrainer:
                                         conflict_token_weight * response_mask
                                     ).sum(dim=-1) / response_mask.sum(dim=-1).clamp(min=1.0)
                                     dom_w = per_seq if dom_w is None else dom_w * per_seq
+                                if self.mt_precision_loss_weights is not None:
+                                    precision_w = build_precision_loss_weights(
+                                        batch.non_tensor_batch["student_bits"], self.mt_teacher_bits,
+                                        self.mt_precision_loss_weights, response_mask.device,
+                                    )
+                                    dom_w = precision_w if dom_w is None else dom_w * precision_w
+                                    for bits in self.mt_teacher_bits:
+                                        selected = torch.as_tensor(
+                                            np.asarray(batch.non_tensor_batch["student_bits"]) == bits,
+                                            device=precision_w.device,
+                                        )
+                                        if selected.any():
+                                            metrics[f"mt_opd/precision/w{bits}/loss_weight"] = (
+                                                precision_w[selected].mean().item()
+                                            )
                                 if dom_w is not None:
                                     batch.batch["domain_loss_weight"] = dom_w
-                                    for dom in sorted(set(str(d) for d in domains)):
+                                    for dom in sorted(set(str(d) for d in domains)) if domains is not None else ():
                                         sel = [i for i, d in enumerate(domains) if str(d) == dom]
                                         if sel:
                                             metrics[f"mt_opd/domain/{dom}/loss_weight"] = (

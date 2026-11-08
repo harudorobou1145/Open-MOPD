@@ -1,5 +1,209 @@
 # Shared AnyPrecision Student In Original MOPD
 
+## Storage and checkpoint follow-up (2026-11-04)
+
+This follow-up supersedes the storage/checkpoint blocker recorded below.
+After the host-side permission change, actual mkdir/touch/remove succeeded
+under `/data/anyprecision_mopd` (about 17 TB available).
+
+Executed the WikiText launcher with batch 1, 16 response tokens, one training
+step and `trainer.save_freq=1`. The complete checkpoint was saved under
+`/data/anyprecision_mopd/save_resume_check_20261104/checkpoints/global_step_1`:
+model 3,944,924,555 bytes, optimizer 402,719,467 bytes, extra state,
+data-loader state and model/tokenizer configuration.
+
+A separate invocation used `trainer.resume_mode=resume_path`, that checkpoint
+folder, `trainer.total_training_steps=2` and saving disabled. Logs confirm
+model and optimizer loading followed by completion of step 2 with finite
+gradient norm 2.4016196728 and no traceback. Logs are `save.log` and
+`resume.log` in `/data/anyprecision_mopd/save_resume_check_20261104`.
+
+Thus the short real-data generation/scoring/update/save/resume cycle is
+verified with the W4 AWQ FP16 and local GPTQ W8 FP16 teachers. This does not
+verify a full epoch, the default batch-8/response-128 configuration,
+held-out PPL improvement, standalone packed export, or bitwise equivalence
+between uninterrupted and resumed training. No full epoch was launched.
+
+## WikiText + GPTQ W8 integration check (2026-11-04)
+
+The local model is Qwen3.5-0.8B, not an 8B model. The independent W8
+teacher is a GPTQ post-training quantization of the base, not a demonstrated
+fine-tuned/distilled teacher. It has 72 packed MLP projections; attention
+and other modules remain floating point. Do not use the failed W4-smoke
+directory (zero quantized modules).
+
+The original teacher worker failed to load this GPTQ checkpoint through
+Transformers because that adapter requires the absent `optimum` package.
+GPTQ checkpoints now use the already installed `GPTQModel.load` and return
+its frozen underlying model. AWQ/compressed-tensors loading is unchanged.
+
+Validated the original worker with the community W4 AWQ teacher (FP16,
+`torch_awq`) and local `Qwen3.5-0.8B-GPTQ-MLP-W8-cal128-seq2048` teacher
+(FP16, `torch`). Official tokenizer token IDs match both teachers. Sampled
+token and top-k log probabilities are finite and agree for identical IDs.
+GPU check log: `/tmp/gptq_teacher_worker_check.log`.
+
+Ran the original Ray/FSDP trainer for two real WikiText steps using the
+existing shared AnyPrecision cache, HF sequential W4/W8 rollout, batch 1
+prompt expanded to two precision responses, top-k 4, 16-token responses,
+1024-token prompt limit, seed 42 and learning rate 1e-6. Raw text template
+was applied; no task verifier, validation, checkpoint save or resume was
+performed. The train file was also supplied as the required val path, but
+validation was disabled; it is NOT a held-out evaluation.
+
+| Metric | Step 1 | Step 2 |
+| --- | --- | --- |
+| Pre-clipping gradient norm | 7.123154 | 2.401772 |
+| Policy surrogate loss | 0.048938 | 0.007757 |
+| Peak allocated GPU GiB | 10.912 | 11.294 |
+| Step seconds | 10.181 | 7.139 |
+
+Both precision microbatches reached backward each step and training completed
+without a traceback. These are short plumbing checks, not convergence,
+long-context memory measurements or evidence of quality improvement.
+Training log: `/tmp/wikitext_gptq_mopd_check_20261104.log`.
+
+Added `scripts/local/wikitext_anyprecision_mopd.sh`: defaults to the above
+teacher pair with FP16 for BOTH, WikiText raw prompts, HF rollout, batch 8,
+128 response tokens, one epoch and checkpoint frequency 100 (keep one actor
+checkpoint). It uses `/data/anyprecision_mopd/wikitext_<timestamp>` and checks
+output-parent write access before execution. Preview and execute from the repo:
+
+```bash
+bash scripts/local/wikitext_anyprecision_mopd.sh --dry-run
+bash scripts/local/wikitext_anyprecision_mopd.sh --run
+```
+
+Use environment variables `OUTPUT_DIR`, `TRAIN_BATCH_SIZE`,
+`MAX_RESPONSE_LENGTH`, `CUDA_VISIBLE_DEVICES` to change these defaults.
+Trailing Hydra overrides can bound training, for example:
+
+```bash
+TRAIN_BATCH_SIZE=1 MAX_RESPONSE_LENGTH=16 \
+bash scripts/local/wikitext_anyprecision_mopd.sh --run -- \
+	trainer.total_training_steps=2 trainer.save_freq=1
+```
+
+This save-enabled command has NOT been executed: `/workspace` has only
+about 2.1 GB free, and `/data` has about 17 TB free but is not writable by
+this container session (nor by a check under its displayed owner UID).
+The launcher correctly refuses to run with its current `/data` default.
+The host/storage administrator must expose a writable project directory
+and set `OUTPUT_DIR` accordingly. Put Ray spill/temp and future large caches
+there as well once writable; do not delete existing artifacts automatically.
+Checkpoint save/reload with this teacher pair remains unverified.
+
+Before a quality claim or expensive full epoch: measure held-out WikiText
+PPL for both student precisions and both teachers with identical scoring
+windows, then compare pre/post training; prepare a separate validation set.
+Batch 8 / 128-token default memory and throughput are not established by
+the batch 1 / 16-token check. A full epoch has about 2970 optimizer updates
+at batch 8 (depending on loader drop-last), not two steps. The earlier
+GSM8K run does not establish WikiText improvement. A standalone packed
+student export remains a separate unverified delivery requirement.
+
+Regression: 10 precision-routing tests ran, 8 passed and 2 opt-in GPU tests
+skipped; the teacher GPU test was run separately and passed with
+`MOPD_GPU_TEST=1 MOPD_GPTQ_TEACHER=<absolute W8 GPTQ directory>`.
+
+## WikiText MOPD input preparation (2026-11-02)
+
+Added `scripts/local/prepare_wikitext.py`. Converted WikiText-2 raw train
+to `/workspace/my_project/data/wikitext2_mopd/train.parquet`, with a sibling
+`manifest.json`. Of 36718 source rows, 23767 nonblank rows were retained.
+Text, titles and source order are preserved; no chunking, shuffle, answers
+or validation/test rows were added. All retained rows fit 1024 tokens with
+the local Qwen3.5 tokenizer. Short rows and titles remain in the training pool.
+
+Use this file as the launcher's training input, keep true task reward disabled,
+and explicitly set the following data configuration (not the default Qwen
+chat template):
+
+```yaml
+data:
+	apply_chat_template_kwargs:
+		chat_template: "{{ messages[0]['content'] }}"
+```
+
+Each stored prompt is one message for schema compatibility, but this template
+emits only its raw content, without user/assistant markers. The student must
+generate its own continuation; the source text is not a supervised target.
+No teacher precision/domain label is encoded in the data: existing precision
+pairing supplies it during training. No held-out validation input was prepared.
+
+Validation: conversion checked template equality for every retained row.
+The original RLHFDataset with tokenizer-only processing loaded all 23767 rows,
+and first/last raw_prompt_ids matched the original text tokenization exactly.
+Processor-based integration and an actual training step were not run.
+This preparation did not launch training or PPL evaluation or change launch
+defaults. Data files were not committed or uploaded.
+
+## W8 GPTQ calibration run (2026-11-02)
+
+Rebuilt the W8 FP16 candidate from the original Qwen3.5-0.8B with
+128 calibration windows of 2048 tokens (262144 sampled tokens, windows may
+overlap). The script now samples unique window starts with seed 42 from
+double-newline joined WikiText-2 raw train text; validation/test are not used.
+Defaults changed from the 16x256 probe to 128x2048. Group size remains 128,
+MLP-only scope remains unchanged, and attention is not quantized.
+
+Output: `/workspace/my_project/models/Qwen3.5-0.8B-GPTQ-MLP-W8-cal128-seq2048`.
+Calibration arguments, window starts and token IDs are saved in
+`teacher_experiment.json`. The previous probe outputs were not overwritten.
+Logs: `/workspace/my_project/outputs/gptq_w8_cal128_seq2048.log` and
+`/workspace/my_project/outputs/gptq_w8_cal128_seq2048_verify.log`.
+
+Validation: script syntax and window-bound checks passed. The saved model
+reloaded using GPTQModel's torch backend, FP16 and SDPA; all 72 packed MLP
+modules observed FP16 inputs on the smoke passage. Loss was 2.947725772857666
+and logits were finite. This is not full WikiText PPL, evidence of superiority
+over the student, or verification of MOPD teacher integration. Internal FP32
+operations and generic backend weight reconstruction may still occur.
+No MOPD training or model upload was performed. Disk remaining: about 4.2 GB.
+
+## GPTQ teacher probe (2026-11-02)
+
+Added `scripts/local/gptq_teacher.py` to build independent MLP-only W4/W8
+teachers from the same local Qwen3.5-0.8B base using GPTQModel 5.8.0.
+Calibration uses Salesforce/wikitext, wikitext-2-raw-v1 train only, seed 42,
+16 shuffled eligible text rows truncated to 256 tokens, group size 128 and
+FP16 loading. This is a compatibility probe, not final calibration quality.
+
+The old dataset alias failed Hub URI parsing; the full namespace works.
+An initial negative-lookahead dynamic exclusion produced zero quantized
+modules. The script now excludes attention explicitly and requires exactly
+72 packed MLP projections before saving. The failed output remains at
+`/workspace/my_project/models/Qwen3.5-0.8B-GPTQ-MLP-W4-smoke` and must NOT
+be used as a quantized teacher.
+
+Successful local outputs:
+
+- `/workspace/my_project/models/Qwen3.5-0.8B-GPTQ-MLP-W4-probe2`
+- `/workspace/my_project/models/Qwen3.5-0.8B-GPTQ-MLP-W8-smoke`
+
+Validation: both saved models reload with backend `torch`, each has 72
+qweight modules, a sampled quantized module receives FP16 input, and the
+same short text produces finite next-token loss. Saved calibration token
+IDs match exactly across bit widths. The loader produces a text-only model;
+integration with original MOPD teacher loading is not yet tested. Generic
+torch quantized execution may reconstruct weights and is not a verified
+fused packed-kernel teacher runtime. Internal operations may use FP32;
+the FP16 observation does not assert every intermediate has that dtype.
+
+W8 FP16 recheck (2026-11-02): reused the existing W8 output without another
+quantization run or model copy. Loaded with `backend=torch`, FP16 and SDPA;
+forward pre-hooks on all 72 packed MLP modules observed only FP16 inputs
+on one short English passage. Next-token loss was 2.9445641040802 and all
+logits were finite. This is a smoke check, not WikiText PPL or proof that
+all internal accumulations use FP16. Reference fallbacks for causal_conv1d
+and gated delta rule were reported; throughput is not established.
+
+No full WikiText validation/test PPL, teacher-versus-student comparison,
+MOPD training, Git commit or GitHub upload was performed for this probe.
+Remaining disk space after the experiment is approximately 6.2 GB; avoid
+creating more model copies before reviewing storage. Each output contains
+`teacher_experiment.json` with arguments and actual calibration token IDs.
+
 ## Experiment update (2026-11-01)
 
 This update supersedes the historical HF-only limits below.
