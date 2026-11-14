@@ -133,8 +133,13 @@ def create_device_mesh(world_size, fsdp_size):
     return device_mesh
 
 
-def get_sharding_strategy(device_mesh):
+def get_sharding_strategy(device_mesh, strategy=None):
     from torch.distributed.fsdp import ShardingStrategy
+
+    if strategy is not None:
+        if strategy != "no_shard" or device_mesh.ndim != 1:
+            raise ValueError("Explicit sharding_strategy supports only no_shard with a one-dimensional mesh")
+        return ShardingStrategy.NO_SHARD
 
     if device_mesh.ndim == 1:
         sharding_strategy = ShardingStrategy.FULL_SHARD
@@ -482,8 +487,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 raise ValueError("AnyPrecision requires positive fixed actor microbatches")
             if self.config.rollout.name == "hf" and self.config.rollout.get("micro_batch_size", 0) < 1:
                 raise ValueError("AnyPrecision requires a positive rollout.micro_batch_size")
-            if self.world_size not in (1, 2) or self.config.rollout.mode != "sync":
-                raise ValueError("AnyPrecision supports one or two GPUs with synchronous training")
+            if self.world_size not in (1, 2, 4) or self.config.rollout.mode != "sync":
+                raise ValueError("AnyPrecision supports one, two or four GPUs with synchronous training")
             if self.config.rollout.log_prob_use_dynamic_bsz or self.config.rollout.log_prob_micro_batch_size_per_gpu < 1:
                 raise ValueError("AnyPrecision requires positive fixed log-probability microbatches")
             if PrecisionType.to_dtype(fsdp_config.get("model_dtype", "fp32")) != torch.float32:
@@ -540,7 +545,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             print(f"wrap_policy: {auto_wrap_policy}")
 
         fsdp_mesh = self.device_mesh
-        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        requested_strategy = fsdp_config.get("sharding_strategy", None)
+        if requested_strategy is not None and self.config.actor.strategy != "fsdp":
+            raise ValueError("Explicit sharding_strategy requires FSDP1")
+        sharding_strategy = get_sharding_strategy(fsdp_mesh, requested_strategy)
+        if self.rank == 0:
+            print(f"{role} sharding_strategy: {sharding_strategy}")
 
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
@@ -738,7 +748,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with FSDP.summon_full_params(self.actor_module_fsdp, writeback=False):
                 params = {name: value.detach().cpu().clone()
                           for name, value in self.actor_module_fsdp.module.state_dict().items()
-                          if name.endswith((".delta", ".base_lut4", ".base_lut8"))}
+                          if name.endswith((".delta", *(f".base_lut{bits}" for bits in range(2, 9))))}
         else:
             params = self.actor_module_fsdp.state_dict()
 
@@ -1089,7 +1099,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+        if fsdp_version(self.actor.actor_module) == 1 and self.actor.actor_module._handle.uses_sharded_strategy:
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
@@ -1124,7 +1134,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+        if fsdp_version(self.actor.actor_module) == 1 and self.actor.actor_module._handle.uses_sharded_strategy:
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
@@ -1152,7 +1162,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+        if fsdp_version(self.actor.actor_module) == 1 and self.actor.actor_module._handle.uses_sharded_strategy:
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:

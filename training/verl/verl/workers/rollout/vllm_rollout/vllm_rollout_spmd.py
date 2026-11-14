@@ -526,8 +526,8 @@ class vLLMRollout(BaseRollout):
             if bits is None or len(bits) != len(prompts):
                 raise ValueError("Compressed rollout requires student_bits for every prompt")
             if any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
-                   or int(value) not in (4, 8) for value in bits):
-                raise ValueError("Compressed rollout requires integer W4/W8 student_bits")
+                         or int(value) not in range(2, 9) for value in bits):
+                     raise ValueError("Compressed rollout requires integer W2-W8 student_bits")
             order = []
             results = []
             for precision in sorted(set(int(value) for value in bits)):
@@ -727,7 +727,7 @@ class vLLMRollout(BaseRollout):
             from any_precision.integrations.vllm.control import update_from_actor
 
             state = {name: value.detach().cpu() for name, value in weights
-                     if name.endswith((".delta", ".base_lut4", ".base_lut8"))}
+                     if name.endswith((".delta", *(f".base_lut{bits}" for bits in range(2, 9))))}
             self.inference_engine.reset_prefix_cache()
             self.inference_engine.apply_model(lambda model: update_from_actor(model, state.items()))
             return

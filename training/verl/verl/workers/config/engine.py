@@ -105,6 +105,7 @@ class FSDPEngineConfig(BaseConfig):
     offload_policy: bool = False
     reshard_after_forward: bool = True
     fsdp_size: int = -1
+    sharding_strategy: Optional[str] = None
     forward_prefetch: bool = False
     model_dtype: str = "fp32"
     use_orig_params: bool = False

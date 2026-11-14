@@ -1912,7 +1912,10 @@ class RayPPOTrainer:
 
                 anyprecision = self.config.actor_rollout_ref.model.get("anyprecision", None)
                 if anyprecision:
-                    precisions = list(anyprecision.precisions)
+                    precisions = list(anyprecision.get("train_precisions", anyprecision.precisions))
+                    if (not precisions or len(set(precisions)) != len(precisions)
+                        or not set(precisions).issubset(anyprecision.precisions)):
+                        raise ValueError("train_precisions must be a nonempty unique subset of student precisions")
                     batch = batch.repeat(repeat_times=len(precisions), interleave=True)
                     batch.non_tensor_batch["student_bits"] = np.tile(precisions, len(batch) // len(precisions))
 
@@ -1937,11 +1940,19 @@ class RayPPOTrainer:
                             precision_order = None
                             if self.config.trainer.get("precision_per_gpu", False):
                                 bits = gen_batch_output.non_tensor_batch.get("student_bits")
-                                if (self.config.trainer.n_gpus_per_node != 2
-                                        or self.config.trainer.nnodes != 1 or bits is None
-                                        or set(bits) != {4, 8}
-                                        or np.count_nonzero(bits == 4) != np.count_nonzero(bits == 8)):
-                                    raise ValueError("precision_per_gpu requires two GPUs and equal W4/W8 task counts")
+                                gpu_count = self.config.trainer.n_gpus_per_node
+                                precision_config = self.config.actor_rollout_ref.model.anyprecision
+                                configured_bits = list(getattr(precision_config, "train_precisions", precision_config.precisions))
+                                if (self.config.trainer.nnodes != 1 or bits is None
+                                    or not configured_bits or len(set(configured_bits)) != len(configured_bits)
+                                    or gpu_count % len(configured_bits) != 0
+                                    or self.config.actor_rollout_ref.rollout.tensor_model_parallel_size != 1
+                                    or set(bits) != set(configured_bits)
+                                    or len(bits) % gpu_count != 0
+                                    or any(np.count_nonzero(bits == precision) * len(configured_bits) != len(bits)
+                                           for precision in configured_bits)):
+                                    raise ValueError("precision_per_gpu requires one node, TP=1, equal precision task "
+                                             "counts and GPU count divisible by precision count")
                                 precision_order = np.argsort(bits, kind="stable")
                                 gen_batch_output.reorder(torch.as_tensor(precision_order))
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)

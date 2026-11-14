@@ -17,6 +17,81 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PrecisionRoutingTests(unittest.TestCase):
+    def test_vllm_sync_keeps_w2_codebooks(self):
+        sources = [SOURCE.parents[1] / "fsdp_workers.py",
+                   SOURCE.parents[1] / "rollout/vllm_rollout/vllm_rollout_spmd.py"]
+        for source in sources:
+            tree = ast.parse(source.read_text())
+            filters = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                       and isinstance(node.func, ast.Attribute) and node.func.attr == "endswith"
+                       and ".base_lut" in ast.unparse(node)]
+            self.assertTrue(filters)
+            for predicate in filters:
+                code = compile(ast.Expression(predicate), str(source), "eval")
+                for suffix in ("delta", "base_lut2", "base_lut4", "base_lut8"):
+                    self.assertTrue(eval(code, {"name": f"model.layers.0.mlp.gate_proj.{suffix}"}))
+                self.assertFalse(eval(code, {"name": "model.layers.0.mlp.gate_proj.weight"}))
+
+    def test_anyprecision_multiple_response_batch_validation(self):
+        from omegaconf import OmegaConf
+
+        config_source = SOURCE.parents[2] / "utils/config.py"
+        tree = ast.parse(config_source.read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "validate_config")
+        start = next(index for index, node in enumerate(function.body)
+                     if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "anyprecision")
+        end = next(index for index, node in enumerate(function.body)
+                   if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                   and ast.unparse(node.value.func) == "actor_config.validate")
+        code = compile(ast.Module(body=function.body[start:end + 1], type_ignores=[]), str(config_source), "exec")
+        for bits in ([2], [4], [2, 4, 8]):
+            for responses in (1, 3):
+                batch_size = 16 * len(bits) * responses
+                config = OmegaConf.create({"data": {"train_batch_size": 16}, "actor_rollout_ref": {
+                    "model": {"anyprecision": {"precisions": list(range(2, 9)), "train_precisions": bits}},
+                    "rollout": {"n": responses}}})
+                actor = SimpleNamespace(ppo_epochs=1, ppo_mini_batch_size=batch_size, validate=Mock())
+                exec(code, {"config": config, "actor_config": actor, "n_gpus": 2})
+                actor.validate.assert_called_once_with(2, batch_size, config.actor_rollout_ref.model)
+
+    def test_replicated_student_sharding_strategy(self):
+        from torch.distributed.fsdp import ShardingStrategy
+        from verl.workers.config.engine import FSDPEngineConfig
+
+        self.assertEqual(FSDPEngineConfig(sharding_strategy="no_shard").sharding_strategy, "no_shard")
+
+        worker_source = SOURCE.parents[1] / "fsdp_workers.py"
+        tree = ast.parse(worker_source.read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "get_sharding_strategy")
+        namespace = {}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(worker_source), "exec"), namespace)
+        get_strategy = namespace["get_sharding_strategy"]
+        self.assertEqual(get_strategy(SimpleNamespace(ndim=1)), ShardingStrategy.FULL_SHARD)
+        self.assertEqual(get_strategy(SimpleNamespace(ndim=2)), ShardingStrategy.HYBRID_SHARD)
+        self.assertEqual(get_strategy(SimpleNamespace(ndim=1), "no_shard"), ShardingStrategy.NO_SHARD)
+        for dimensions, strategy in ((2, "no_shard"), (1, "invalid")):
+            with self.subTest(dimensions=dimensions, strategy=strategy), self.assertRaises(ValueError):
+                get_strategy(SimpleNamespace(ndim=dimensions), strategy)
+
+    def test_replicated_student_skips_manual_reshard(self):
+        worker_source = SOURCE.parents[1] / "fsdp_workers.py"
+        tree = ast.parse(worker_source.read_text())
+        worker = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                  and node.name == "ActorRolloutRefWorker")
+        methods = [node for node in worker.body if isinstance(node, ast.FunctionDef)
+               and node.name in {"compute_log_prob", "compute_log_probs_for_ids", "compute_distillation_reward"}]
+        self.assertEqual(len(methods), 3)
+        guards = [node for method in methods for node in ast.walk(method) if isinstance(node, ast.If)
+                  and any(isinstance(statement, ast.Expr)
+                          and isinstance(statement.value, ast.Call)
+                          and isinstance(statement.value.func, ast.Attribute)
+                          and statement.value.func.attr == "reshard" for statement in node.body)]
+        self.assertEqual(len(guards), 3)
+        for guard in guards:
+            self.assertIn("uses_sharded_strategy", ast.unparse(guard.test))
+
     def test_precision_loss_weights(self):
         bits = [8, 4, 8, 4]
         self.assertIsNone(MODULE.build_precision_loss_weights(bits, [4, 8], None, "cpu"))
@@ -96,25 +171,42 @@ class PrecisionRoutingTests(unittest.TestCase):
                       and any(isinstance(child, ast.Name) and child.id == "precision_order"
                               for child in ast.walk(node)))
         code = compile(ast.Module(body=branch.body, type_ignores=[]), str(trainer_source), "exec")
-        for enabled in (False, True):
+        for enabled, gpu_count, precisions, tp, valid in (
+            (False, 2, [4, 8], 1, True), (True, 2, [4, 8], 1, True),
+            (True, 4, [4, 8], 1, True), (True, 4, [2, 4], 1, True),
+            (True, 3, [4, 8], 1, False), (True, 4, [4, 8], 2, False),
+            (True, 16, [4, 8], 1, False), (True, 4, [4, 4], 1, False)):
             data = DataProto(batch=TensorDict({"marker": torch.arange(4).repeat_interleave(2)}, batch_size=8),
-                             non_tensor_batch={"student_bits": np.tile([4, 8], 4)})
+                     non_tensor_batch={"student_bits": np.tile(precisions, 4)})
 
             def generate(batch):
                 if enabled:
-                    self.assertEqual(batch.non_tensor_batch["student_bits"].tolist(), [4] * 4 + [8] * 4)
+                    self.assertEqual(batch.non_tensor_batch["student_bits"].tolist(),
+                                     [precisions[0]] * 4 + [precisions[1]] * 4)
                     self.assertEqual(batch.batch["marker"].tolist(), list(range(4)) * 2)
+                    chunks = np.split(batch.non_tensor_batch["student_bits"], gpu_count)
+                    self.assertTrue(all(len(set(chunk)) == 1 for chunk in chunks))
                 batch.batch["response_marker"] = batch.batch["marker"] * 10 + torch.tensor(
                     batch.non_tensor_batch["student_bits"])
                 return batch
 
             trainer = SimpleNamespace(config=SimpleNamespace(trainer=SimpleNamespace(
-                get=lambda key, default: enabled, n_gpus_per_node=2, nnodes=1)),
+                get=lambda key, default: enabled, n_gpus_per_node=gpu_count, nnodes=1),
+                actor_rollout_ref=SimpleNamespace(
+                    model=SimpleNamespace(anyprecision=SimpleNamespace(precisions=precisions)),
+                    rollout=SimpleNamespace(tensor_model_parallel_size=tp))),
                 actor_rollout_wg=SimpleNamespace(generate_sequences=generate))
+            if precisions == [2, 4]:
+                trainer.config.actor_rollout_ref.model.anyprecision = SimpleNamespace(
+                    precisions=[2, 3, 4, 5, 6, 7, 8], train_precisions=[2, 4])
             namespace = dict(self=trainer, gen_batch_output=data, np=np, torch=torch)
+            if not valid:
+                with self.assertRaises(ValueError):
+                    exec(code, namespace)
+                continue
             exec(code, namespace)
             self.assertEqual(namespace["gen_batch_output"].batch["response_marker"].tolist(),
-                             [4, 8, 14, 18, 24, 28, 34, 38])
+                             [marker * 10 + precision for marker in range(4) for precision in precisions])
 
     def test_teacher_entropy_noncontiguous_batch(self):
         from verl.workers.fsdp_workers import RewardModelWorker
@@ -177,12 +269,12 @@ class PrecisionRoutingTests(unittest.TestCase):
 
         rollout.generate_sequences = generate
         data = DataProto(batch=TensorDict({"marker": torch.arange(4)}, batch_size=4),
-                         non_tensor_batch={"student_bits": np.array([8, 4, 8, 4])})
+                         non_tensor_batch={"student_bits": np.array([8, 2, 8, 4])})
         result = generate(data)
-        self.assertEqual(groups, [[4, 4], [8, 8]])
+        self.assertEqual(groups, [[2], [4], [8, 8]])
         self.assertEqual(result.batch["marker"].tolist(), [0, 1, 2, 3])
-        self.assertEqual(result.non_tensor_batch["student_bits"].tolist(), [8, 4, 8, 4])
-        self.assertEqual(rollout.inference_engine.reset_prefix_cache.call_count, 2)
+        self.assertEqual(result.non_tensor_batch["student_bits"].tolist(), [8, 2, 8, 4])
+        self.assertEqual(rollout.inference_engine.reset_prefix_cache.call_count, 3)
 
     def test_student_precision_selection(self):
         layer = torch.nn.Linear(2, 2)

@@ -131,7 +131,7 @@ if [[ -n "${ANYPRECISION_CACHE:-}" ]]; then
     ((${#LOCAL_TEACHER_PATHS[@]} == 2)) || local_die "AnyPrecision requires W4A16 then W8A16 teachers"
     cmd+=(
         "+actor_rollout_ref.model.anyprecision.cache_path='${ANYPRECISION_CACHE}'"
-        "+actor_rollout_ref.model.anyprecision.precisions=[4,8]"
+        "+actor_rollout_ref.model.anyprecision.precisions=${ANYPRECISION_BITS:-[4,8]}"
         "actor_rollout_ref.model.use_remove_padding=False"
         "actor_rollout_ref.model.use_fused_kernels=False"
         "+actor_rollout_ref.model.override_config.attn_implementation=sdpa"
@@ -162,7 +162,7 @@ if [[ -n "${ANYPRECISION_CACHE:-}" ]]; then
         "+mt_reward_model_1.model.quantized_teacher=True"
         "+mt_reward_model_1.model.dtype=bf16"
         "+mt_opd.domain_weighting=precision_routing"
-        "+mt_opd.teacher_bits=[4,8]"
+        "+mt_opd.teacher_bits=${ANYPRECISION_TRAIN_BITS:-${ANYPRECISION_BITS:-[4,8]}}"
     )
     # ANYPRECISION_ROLLOUT chooses hf or vllm; direct default is hf.
     case "${ANYPRECISION_ROLLOUT:-hf}" in
