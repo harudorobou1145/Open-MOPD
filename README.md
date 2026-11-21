@@ -4,6 +4,10 @@
   <b>An open recipe for multi-teacher on-policy distillation.</b>
 </p>
 
+**Qwen3.5-0.8B AnyPrecision experiments (dev1).** Start with a full-projection cache from the [AnyPrecision guide](https://github.com/harudorobou1145/any-precision-llm/blob/dev1/TRAINABLE_QWEN.md). The [W2/W4 training launcher](https://github.com/harudorobou1145/Open-MOPD/blob/dev1/my_scripts/run_w2w4_bf16.sh) uses two teachers; for the codebook-only comparison, disable prefix updates (`++actor_rollout_ref.actor.prefix_pv_enabled=false`).
+
+The [WikiText-2 evaluator](https://github.com/harudorobou1145/Open-MOPD/blob/dev1/my_scripts/eval_anyprecision_wikitext.py) compares W2/W4/W6/W8 on the same test tokens. `--baseline-only` evaluates the initial cache. `--nearest-teacher` is a separate offline diagnostic: it chooses indices independently for each evaluated width, so its PPL is not the PPL of a single deployable shared-index model.
+
 <p align="center">
   Huan-ang Gao<sup>*,1,2,3</sup> · Haohan Chi<sup>*,1,2,3</sup> · Yong Yan<sup>1,2,3</sup> · Shiyuan Feng<sup>1,2</sup> · Hanlin Wu<sup>1,2</sup><br>
   Zheng Jiang<sup>3</sup> · Bingxiang He<sup>3</sup> · Wei-Ying Ma<sup>1,2</sup> · Ya-Qin Zhang<sup>1,2</sup> · Hao Zhou<sup>1,2,†</sup>
