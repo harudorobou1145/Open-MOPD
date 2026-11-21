@@ -472,6 +472,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
 
         anyprecision = self.config.model.get("anyprecision", None)
+        if role == "actor" and self.config.actor.get("protective_out_proj", False):
+            if not anyprecision or fsdp_config.get("sharding_strategy") != "no_shard":
+                raise ValueError("Protective out_proj flips require AnyPrecision with explicit NO_SHARD")
+            if 4 not in anyprecision.get("train_precisions", []):
+                raise ValueError("Protective out_proj flips require W4 actor activations")
+        if role == "actor" and self.config.actor.get("prefix_pv_enabled", False):
+            if (not anyprecision or self.config.rollout.name not in ("hf", "vllm") or
+                    fsdp_config.get("sharding_strategy", None) != "no_shard"):
+                raise ValueError("Prefix PV requires AnyPrecision, HF/compressed vLLM rollout and explicit NO_SHARD")
+            if set(anyprecision.get("train_precisions", [])) != {2, 4}:
+                raise ValueError("Prefix PV currently requires train_precisions=[2,4]")
         if anyprecision and role == "actor":
             if self.config.rollout.name not in ("hf", "vllm") or use_remove_padding or use_fused_kernels:
                 raise ValueError("AnyPrecision requires HF/compressed vLLM rollout, padded inputs and unfused kernels")
@@ -748,7 +759,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with FSDP.summon_full_params(self.actor_module_fsdp, writeback=False):
                 params = {name: value.detach().cpu().clone()
                           for name, value in self.actor_module_fsdp.module.state_dict().items()
-                          if name.endswith((".delta", *(f".base_lut{bits}" for bits in range(2, 9))))}
+                          if name.endswith((".delta", ".indices", *(f".base_lut{bits}" for bits in range(2, 9))))}
         else:
             params = self.actor_module_fsdp.state_dict()
 
@@ -1877,16 +1888,17 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         trust_remote_code = config.model.get("trust_remote_code", False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
 
-        if config.model.get("quantized_teacher", False):
-            if not getattr(model_config, "quantization_config", None):
+        if config.model.get("quantized_teacher", False) or config.model.get("dequantized_teacher", False):
+            quantization_config = getattr(model_config, "quantization_config", None)
+            if config.model.get("quantized_teacher", False) and not quantization_config:
                 raise ValueError("quantized_teacher requires a quantized checkpoint")
             if config.model.get("use_remove_padding", False) or self.ulysses_sequence_parallel_size != 1:
                 raise ValueError("Quantized teachers require use_remove_padding=False and sequence parallel size 1")
             if config.model.get("use_fused_kernels", False):
                 raise ValueError("Quantized teachers do not support the fused scoring path")
-            if config.model.get("quantization_backend", None):
+            if quantization_config and config.model.get("quantization_backend", None):
                 model_config.quantization_config["backend"] = config.model.quantization_backend
-            if model_config.quantization_config.get("quant_method") == "gptq":
+            if quantization_config and quantization_config.get("quant_method") == "gptq":
                 from gptqmodel import GPTQModel
 
                 reward_module = GPTQModel.load(

@@ -1038,6 +1038,44 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
+                reassign_path = self.config.get("bf16_reassign_model_path", None)
+                protective = None
+                if self.config.get("protective_out_proj", False):
+                    if reassign_path or self.config.get("prefix_pv_enabled", False):
+                        raise ValueError("Protective flips cannot be combined with other index strategies")
+                    from any_precision.trainable import ProtectiveOutProj
+
+                    if not hasattr(self, "_protective_out_proj"):
+                        self._protective_out_proj = ProtectiveOutProj(
+                            self.actor_module, self.config.protective_col_fraction, self.config.protective_sample_interval,
+                            scope=self.config.get("protective_scope", "out_proj"),
+                        )
+                    protective = self._protective_out_proj
+                    protective.begin()
+                if reassign_path and self.config.get("prefix_pv_enabled", False):
+                    raise ValueError("BF16 reassignment and prefix PV cannot run together")
+                if reassign_path and not hasattr(self, "_bf16_reassigner"):
+                    from any_precision.trainable import BF16HierarchicalReassigner
+
+                    self._bf16_reassigner = BF16HierarchicalReassigner(self.actor_module, reassign_path)
+
+                prefix_updater = None
+                if self.config.get("prefix_pv_enabled", False):
+                    from any_precision.trainable import FixedPrefixUpdater, TrainableAnyPrecisionLinear
+
+                    prefix_modules = [module for module in self.actor_module.modules()
+                                      if isinstance(module, TrainableAnyPrecisionLinear)]
+                    module_index = self.config.prefix_pv_module
+                    if not 0 <= module_index < len(prefix_modules):
+                        raise ValueError("prefix_pv_module is outside the installed MLP modules")
+                    prefix_module = prefix_modules[module_index]
+                    prefix_updater = FixedPrefixUpdater(
+                        prefix_module, {}, lr=self.config.prefix_pv_lr,
+                        trust_ratio=self.config.prefix_pv_trust_ratio,
+                        max_fraction=self.config.prefix_pv_max_fraction,
+                    )
+                    prefix_module._prefix_updater = prefix_updater
+
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
@@ -1229,6 +1267,47 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                if protective is not None:
+                    flip_stats = protective.finish(torch.isfinite(grad_norm).item())
+                    mini_batch_metrics.update({f"actor/protective_{key}": value for key, value in flip_stats.items()})
+                if reassign_path and torch.isfinite(grad_norm):
+                    changed = self._bf16_reassigner.step()
+                    for module, _ in self._bf16_reassigner.targets:
+                        if torch.distributed.is_initialized():
+                            expected = module.indices.clone()
+                            torch.distributed.broadcast(module.indices, src=0)
+                            mismatch = (expected != module.indices).any().to(torch.int32)
+                            torch.distributed.all_reduce(mismatch)
+                            if mismatch.item():
+                                raise RuntimeError("BF16 reassigned indices differ between ranks")
+                    mini_batch_metrics["actor/bf16_reassign_changed"] = changed
+                    mini_batch_metrics["actor/bf16_reassign_modules"] = len(self._bf16_reassigner.targets)
+                if prefix_updater is not None:
+                    del prefix_module._prefix_updater
+                    if torch.isfinite(grad_norm):
+                        gradient = prefix_updater.gradient
+                        present = torch.tensor(float(gradient is not None), device=prefix_module.indices.device)
+                        if gradient is None:
+                            gradient = torch.zeros_like(prefix_module.indices, dtype=torch.float32)
+                        if torch.distributed.is_initialized():
+                            torch.distributed.all_reduce(gradient)
+                            torch.distributed.all_reduce(present)
+                            gradient.div_(torch.distributed.get_world_size())
+                        if present.item() == 0:
+                            raise RuntimeError("Prefix PV captured no W4 gradients")
+                        prefix_updater.gradient = gradient
+                        prefix_updater.state = self.actor_optimizer.state[prefix_module.delta].setdefault(
+                            "prefix_pv", {})
+                        prefix_metrics = prefix_updater.step()
+                        if torch.distributed.is_initialized():
+                            expected = prefix_module.indices.clone()
+                            torch.distributed.broadcast(prefix_module.indices, src=0)
+                            mismatch = (expected != prefix_module.indices).any().to(torch.int32)
+                            torch.distributed.all_reduce(mismatch)
+                            if mismatch.item():
+                                raise RuntimeError("Prefix PV indices differ between ranks")
+                        mini_batch_metrics.update({f"actor/prefix_pv_{key}": value
+                                                   for key, value in prefix_metrics.items()})
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

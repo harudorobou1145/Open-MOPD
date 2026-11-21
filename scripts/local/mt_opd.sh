@@ -179,6 +179,8 @@ if [[ -n "${ANYPRECISION_CACHE:-}" ]]; then
                 "actor_rollout_ref.rollout.free_cache_engine=True"
                 "actor_rollout_ref.rollout.gpu_memory_utilization=0.3"
                 "+actor_rollout_ref.rollout.engine_kwargs.vllm.quantization=anyprecision"
+                "++actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.quant_method=anyprecision"
+                "++actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.precisions=${ANYPRECISION_BITS}"
                 "+actor_rollout_ref.rollout.engine_kwargs.vllm.model_loader_extra_config.cache_path='${ANYPRECISION_CACHE}'"
                 "+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image=0"
                 "+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.video=0"

@@ -240,6 +240,16 @@ class FSDPActorConfig(ActorConfig):
     use_remove_padding: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     use_rollout_log_probs: bool = False
+    prefix_pv_enabled: bool = False
+    protective_out_proj: bool = False
+    protective_scope: str = "out_proj"
+    protective_col_fraction: float = 0.1
+    protective_sample_interval: int = 20
+    bf16_reassign_model_path: Optional[str] = None
+    prefix_pv_module: int = 0
+    prefix_pv_lr: float = 1e-4
+    prefix_pv_trust_ratio: float = 1e-3
+    prefix_pv_max_fraction: float = 0.01
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""

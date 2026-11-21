@@ -410,6 +410,16 @@ class vLLMRollout(BaseRollout):
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         self.anyprecision = engine_kwargs.get("quantization") == "anyprecision"
         if self.anyprecision:
+            from pathlib import Path
+
+            options = engine_kwargs.get("model_loader_extra_config", {})
+            cached = torch.load(Path(options["cache_path"]) / "weights" / "l0.pt",
+                                map_location="cpu", weights_only=False)
+            overrides = dict(engine_kwargs.get("hf_overrides", {}))
+            quantization = dict(overrides.get("quantization_config", {}))
+            quantization["full_projection"] = any(not key.startswith("mlp.") for key in cached)
+            overrides["quantization_config"] = quantization
+            engine_kwargs["hf_overrides"] = overrides
             if load_format != "anyprecision" or not config.enforce_eager or tensor_parallel_size != 1:
                 raise ValueError("AnyPrecision requires its compressed loader, eager execution and TP=1")
             if config.enable_prefix_caching or self.lora_kwargs:
@@ -727,7 +737,7 @@ class vLLMRollout(BaseRollout):
             from any_precision.integrations.vllm.control import update_from_actor
 
             state = {name: value.detach().cpu() for name, value in weights
-                     if name.endswith((".delta", *(f".base_lut{bits}" for bits in range(2, 9))))}
+                     if name.endswith((".delta", ".indices", *(f".base_lut{bits}" for bits in range(2, 9))))}
             self.inference_engine.reset_prefix_cache()
             self.inference_engine.apply_model(lambda model: update_from_actor(model, state.items()))
             return

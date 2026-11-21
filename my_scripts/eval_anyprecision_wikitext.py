@@ -54,6 +54,15 @@ import torch
 import torch.nn.functional as functional
 
 
+def nearest_prefix(book, target, current):
+    values, order = book.sort(dim=1)
+    right = torch.searchsorted(values, target.contiguous()).clamp_max(values.size(1) - 1)
+    left = (right - 1).clamp_min(0)
+    slot = torch.where((values.gather(1, left) - target).abs() <= (values.gather(1, right) - target).abs(), left, right)
+    candidate = order.gather(1, slot)
+    return torch.where((book.gather(1, current) - target).abs() <= (book.gather(1, candidate) - target).abs(), current, candidate)
+
+
 def load_checkpoint(checkpoint):
     """加载模型权重：支持单个 .pt 文件，或通过分布式进程组聚合 FSDP 分片目录。"""
     path = Path(checkpoint)
@@ -111,6 +120,8 @@ def main():
                         help='仅评测前 N 个块（用于快速冒烟验证）')
     parser.add_argument('--standalone-model',
                         help='若指定该路径，则跳过 AnyPrecision 学生改造，直接评测该独立模型')
+    parser.add_argument('--baseline-only', action='store_true',
+                        help='仅评估初始 AnyPrecision 学生，不加载训练 checkpoint')
     parser.add_argument('--quant-backend',
                         help='独立量化模型的可选后端覆盖（如 auto_round:torch_zp 或 torch_awq）')
     parser.add_argument('--include-teachers', action='store_true',
@@ -119,7 +130,13 @@ def main():
                         help='--include-teachers 模式下的 W4 教师路径')
     parser.add_argument('--teacher-w8', default='/workspace/my_project/models/Qwen3.5-0.8B-GPTQ-MLP-W8-cal128-seq2048',
                         help='--include-teachers 模式下的 W8 教师路径')
+    parser.add_argument('--original-indices', action='store_true', help='Evaluate trained weights with cache indices')
+    parser.add_argument('--nearest-teacher', help='Dense teacher safetensors file for per-precision nearest indices')
     args = parser.parse_args()
+    if args.nearest_teacher and (args.original_indices or args.standalone_model or args.include_teachers):
+        parser.error('--nearest-teacher requires independent student precision evaluation')
+    if args.original_indices and (args.standalone_model or args.baseline_only or args.include_teachers):
+        parser.error('--original-indices requires a student checkpoint')
 
     if args.include_teachers and args.precisions != [4, 8]:
         parser.error('--include-teachers currently requires --precisions 4 8')
@@ -128,7 +145,7 @@ def main():
 
     # 若 checkpoint 是分布式目录，先由所有 rank 协同还原完整权重，非 0 号进程完成后直接退出
     checkpoint_state = None
-    if not args.standalone_model and Path(args.checkpoint).is_dir():
+    if not args.standalone_model and not args.baseline_only and Path(args.checkpoint).is_dir():
         checkpoint_state = load_checkpoint(args.checkpoint)
         if checkpoint_state is None:
             return
@@ -165,7 +182,8 @@ def main():
                     protocol='Non-overlapping blocks, include final partial block, omit each block first token; '
                              'no chat template or added special tokens; summed FP32 token cross entropy.',
                     dtype='FP32 model and delta with BF16 autocast', model=args.model,
-                    cache=args.cache, checkpoint=args.checkpoint, precisions=args.precisions,
+                    cache=args.cache, checkpoint=None if args.baseline_only else args.checkpoint,
+                    precisions=args.precisions,
                     cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
                     smoke_test=args.max_blocks is not None,
                     standalone_model=args.standalone_model,
@@ -199,17 +217,72 @@ def main():
 
     results = []
     stages = ('before', 'after', 'teacher') if args.include_teachers else ('before', 'after')
+    if args.baseline_only:
+        stages = ('before', 'teacher') if args.include_teachers else ('before',)
     if args.standalone_model:
         stages = ('standalone',)
+    if args.original_indices:
+        stages = ('after_original_indices',)
+    if args.nearest_teacher:
+        stages = ('before_nearest_teacher' if args.baseline_only else 'nearest_teacher',)
 
     # 按阶段（训练前 delta=0 -> 训练后加载 checkpoint -> 可选教师）与位宽逐一计算精确 PPL
     for stage in stages:
-        if stage == 'after':
+        if stage in ('after', 'after_original_indices', 'nearest_teacher'):
             state = checkpoint_state if checkpoint_state is not None else load_checkpoint(args.checkpoint)
+            if args.original_indices:
+                differences = {bits: 0 for bits in range(2, 9)}
+                positions = modules = 0
+                for name, original in model.named_buffers():
+                    if not name.endswith('.indices'):
+                        continue
+                    trained = state[name].to(original.device)
+                    if trained.dtype != torch.uint8 or original.dtype != torch.uint8 or trained.shape != original.shape:
+                        raise ValueError(f'Unexpected index layout: {name}')
+                    diff = trained ^ original
+                    for bits in differences:
+                        differences[bits] += (diff >> (8 - bits)).count_nonzero().item()
+                    state[name] = original.detach()
+                    positions += original.numel()
+                    modules += 1
+                if not modules:
+                    raise ValueError('No index buffers found')
+                manifest.update(original_indices=True, prefix_differences=differences, index_positions=positions,
+                                index_modules=modules)
+                (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
             model.load_state_dict(state, strict=True)
             checkpoint_state = None
             del state
+        if args.nearest_teacher:
+            from safetensors import safe_open
+            from any_precision.trainable import TrainableAnyPrecisionLinear
+            projections = [(name, layer, layer.indices.clone()) for name, layer in model.named_modules()
+                           if isinstance(layer, TrainableAnyPrecisionLinear)]
+            if not projections:
+                raise ValueError('No quantized projections')
+            manifest.update(nearest_teacher=args.nearest_teacher, remap={})
         for bits in ((None,) if args.standalone_model else args.precisions):
+            if args.nearest_teacher:
+                old_error = new_error = 0.
+                count = changed = 0
+                shift = 8 - bits
+                with safe_open(args.nearest_teacher, framework='pt', device='cpu') as teacher:
+                    for name, layer, original in projections:
+                        target = teacher.get_tensor(name + '.weight').to(device=original.device, dtype=torch.float32)
+                        book = layer.codebook(bits)
+                        if target.shape != original.shape or not target.isfinite().all() or not book.isfinite().all():
+                            raise ValueError(f'Invalid target or book: {name}')
+                        current = original.long() >> shift
+                        choice = nearest_prefix(book, target, current)
+                        old_error += (book.gather(1, current) - target).square().sum(dtype=torch.float64).item()
+                        new_error += (book.gather(1, choice) - target).square().sum(dtype=torch.float64).item()
+                        changed += (current != choice).sum().item()
+                        count += target.numel()
+                        layer.indices.copy_((choice.byte() << shift) | (original & ((1 << shift) - 1)))
+                manifest['remap'][bits] = dict(modules=len(projections), positions=count, changed=changed,
+                                               mse_before=old_error/count, mse_after=new_error/count)
+                (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+                print(manifest['remap'][bits], flush=True)
             if stage == 'teacher':
                 del model
                 torch.cuda.empty_cache()
